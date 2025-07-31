@@ -1,0 +1,123 @@
+pLTV Prediction System - Summary Report
+==================================================
+
+Dataset Summary:
+- Total players: 109,618
+- Revenue range: $0.00 - $71953.20
+- Paying users: 24,906 (22.7%)
+- Features created: 59
+
+Model Performance (Random Split Validation):
+- mae: 5.0331
+- rmse: 332.8080
+- r2: 0.3727
+- mape: 27.7726
+- explained_variance: 0.3728
+- revenue_accuracy_within_10pct: 0.1844
+- revenue_accuracy_within_25pct: 0.2060
+- revenue_accuracy_within_50pct: 0.2200
+- auc_payer_classification: 1.0000
+- binary_accuracy: 1.0000
+- precision: 1.0000
+- recall: 1.0000
+- f1_score: 1.0000
+- avg_precision: 0.8329
+- avg_recall: 0.9972
+- optimal_threshold: 1.0000
+- optimal_f1: 1.0000
+- lift_top_1pct: 99.6566
+- revenue_capture_top_1pct: 0.9966
+- lift_top_5pct: 19.9895
+- revenue_capture_top_5pct: 0.9995
+- lift_top_10pct: 9.9989
+- revenue_capture_top_10pct: 0.9999
+- lift_top_20pct: 5.0000
+- revenue_capture_top_20pct: 1.0000
+- lift_top_50pct: 2.0000
+- revenue_capture_top_50pct: 1.0000
+- predicted_payer_rate: 0.2272
+- actual_payer_rate: 0.2272
+- calibration_error: 0.0000
+- brier_score: 0.0000
+- high_value_accuracy: 0.9994
+- high_value_precision: 0.9940
+- high_value_recall: 1.0000
+- total_revenue_actual: 150064.1477
+- total_revenue_predicted: 64941.4249
+- revenue_prediction_error: 0.5672
+- mean_predicted_revenue: 2.9621
+- median_predicted_revenue: 0.0000
+- std_predicted_revenue: 126.1784
+- mean_actual_revenue: 6.8447
+- median_actual_revenue: 0.0000
+- std_actual_revenue: 420.1952
+- decile_1_payer_rate: 0.2272
+- decile_1_avg_prob: 0.2272
+- decile_2_payer_rate: 0.2272
+- decile_2_avg_prob: 0.2272
+- decile_3_payer_rate: 0.2272
+- decile_3_avg_prob: 0.2272
+- decile_4_payer_rate: 0.3472
+- decile_4_avg_prob: 0.3472
+- decile_5_payer_rate: 0.4511
+- decile_5_avg_prob: 0.4511
+- decile_6_payer_rate: 0.5633
+- decile_6_avg_prob: 0.5633
+- decile_7_payer_rate: 0.7537
+- decile_7_avg_prob: 0.7537
+- decile_8_payer_rate: 1.0000
+- decile_8_avg_prob: 1.0000
+- decile_9_payer_rate: 1.0000
+- decile_9_avg_prob: 1.0000
+- decile_10_payer_rate: 1.0000
+- decile_10_avg_prob: 1.0000
+
+Cross-Validation Results:
+- mae_mean: 0.0000
+- mae_std: 0.0000
+- rmse_mean: 0.0000
+- rmse_std: 0.0000
+- r2_mean: 0.0000
+- r2_std: 0.0000
+- lift_top_10pct_mean: 0.0000
+- lift_top_10pct_std: 0.0000
+- lift_top_20pct_mean: 0.0000
+- lift_top_20pct_std: 0.0000
+
+Player Segment Distribution:
+- Moderate_Players: 105,459 players (20.3% payer rate, $1.10 avg revenue)
+- Premium_Whales: 4,158 players (84.2% payer rate, $74.59 avg revenue)
+- Engaged_Spenders: 1 players (100.0% payer rate, $3.68 avg revenue)
+
+Top 10 Features (Payer Classification):
+- total_sessions: 283.0000
+- total_revenue: 163.0000
+- total_events: 114.0000
+- events_per_day: 64.0000
+- events_per_session: 21.0000
+- avg_session_duration_minutes: 21.0000
+- sessions_per_day: 15.0000
+- revenue_per_session: 13.0000
+- unique_event_diversity: 11.0000
+- player_lifetime_days: 10.0000
+
+Top 10 Features (Amount Prediction):
+- total_revenue: 899.0000
+- total_received_revenue: 529.0000
+- revenue_progression_score: 193.0000
+- lifecycle_value_score: 140.0000
+- progression_rate: 121.0000
+- revenue_session_rate: 88.0000
+- max_purchase_amount: 81.0000
+- revenue_per_day: 74.0000
+- revenue_engagement_score: 73.0000
+- total_events: 71.0000
+
+Training Statistics:
+- total_samples: 109618
+- payers: 24906
+- non_payers: 84712
+- payer_rate: 0.2272
+- avg_revenue_payers: 17.1128
+- median_revenue_payers: 0.0145
+
