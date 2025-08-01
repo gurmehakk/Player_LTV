@@ -95,6 +95,7 @@ class DataExtractor:
             obs.purchase_events,
             obs.country as first_country,
             
+            DATE(obs.first_session) as first_session_date,
             DATE_DIFF(CURRENT_DATE(), DATE(obs.first_session), DAY) as days_since_first_session,
             
             COALESCE(pred.ltv_target, 0.0) as ltv_target,
@@ -123,7 +124,9 @@ class DataExtractor:
             
 
             # Save raw data to CSV
-            df.to_csv('output_basic_model/raw_data.csv', index=True)
+            import os
+            os.makedirs('output', exist_ok=True)
+            df.to_csv('output/raw_data.csv', index=True)
             
             print(f"Extracted {len(df)} players with LTV targets")
             if len(df) > 0:
