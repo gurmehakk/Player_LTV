@@ -133,8 +133,20 @@ class CompleteLTVPipeline:
     def _run_classification_analysis(self, X, ltv_values, historical_revenue):
         """Run classification analysis for different spending thresholds"""
         
-        # Create classification targets
-        payers = ltv_values[ltv_values > 0]
+        # Handle SMOTE case where X includes ltv_target column
+        if 'ltv_target' in X.columns:
+            # SMOTE was applied - use the resampled LTV values
+            ltv_for_targets = X['ltv_target'].values
+            X_features = X.drop('ltv_target', axis=1)
+            print(f"Using SMOTE-resampled data: {len(X_features)} samples")
+        else:
+            # No SMOTE - use original data
+            ltv_for_targets = ltv_values
+            X_features = X
+            print(f"Using original data: {len(X_features)} samples")
+        
+        # Create classification targets based on the correct LTV values
+        payers = ltv_for_targets[ltv_for_targets > 0]
         
         if len(payers) > 0:
             thresholds = {
@@ -152,10 +164,10 @@ class CompleteLTVPipeline:
             }
         
         targets = {
-            'will_spend': (ltv_values >= thresholds['will_spend']).astype(int),
-            'low_spender': (ltv_values >= thresholds['low_spender']).astype(int),
-            'medium_spender': (ltv_values >= thresholds['medium_spender']).astype(int),
-            'high_spender': (ltv_values >= thresholds['high_spender']).astype(int)
+            'will_spend': (ltv_for_targets >= thresholds['will_spend']).astype(int),
+            'low_spender': (ltv_for_targets >= thresholds['low_spender']).astype(int),
+            'medium_spender': (ltv_for_targets >= thresholds['medium_spender']).astype(int),
+            'high_spender': (ltv_for_targets >= thresholds['high_spender']).astype(int)
         }
         
         print("Classification thresholds:")
@@ -170,9 +182,9 @@ class CompleteLTVPipeline:
             if np.sum(y) < 10:  # Skip if not enough positive examples
                 continue
             
-            # Train/test split
+            # Train/test split using the correct feature matrix
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
+                X_features, y, test_size=0.2, random_state=42, stratify=y
             )
             
             # Train LightGBM model
