@@ -1,0 +1,131 @@
+pLTV Model Validation Report
+==================================================
+
+1. Random Split Validation:
+   Train size: 2,648
+   Test size: 662
+
+   Regression Metrics:
+   - MAE (Mean Absolute Error): 0.0487
+   - RMSE (Root Mean Square Error): 0.4981
+   - R² Score: -0.0281
+   - MAPE (Mean Absolute % Error): 98.89%
+   - Explained Variance: -0.0229
+
+   Payer Classification Metrics:
+   - AUC Score: 0.7561
+   - Binary Accuracy: 0.7281
+   - Precision: 0.3292
+   - Recall: 0.8061
+   - F1 Score: 0.4675
+   - Optimal Threshold: 0.1250
+
+   Revenue Prediction Accuracy:
+   - Within 10%: 0.91%
+   - Within 25%: 1.96%
+   - Within 50%: 4.38%
+
+   Business Impact Metrics:
+   - Lift (Top 1%): 0.53x
+   - Lift (Top 5%): 3.99x
+   - Lift (Top 10%): 2.27x
+   - Lift (Top 20%): 4.15x
+
+   Revenue Capture Analysis:
+   - Top 1% captures: 0.53% of revenue
+   - Top 5% captures: 19.94% of revenue
+   - Top 10% captures: 22.70% of revenue
+   - Top 20% captures: 82.94% of revenue
+
+   High-Value Player Identification (Top 10% Spenders):
+   - Accuracy: 0.8980
+   - Precision: 0.0000
+   - Recall: 0.0000
+
+   Model Calibration:
+   - Predicted Payer Rate: 13.20%
+   - Actual Payer Rate: 14.80%
+   - Calibration Error: 0.0161
+   - Brier Score: 0.1113
+
+3. Cross-validation Results (Model Stability):
+   MAE: 0.0386 ± 0.0288
+   RMSE: 0.5190 ± 0.5013
+   R2: 0.0000 ± 0.0000
+
+4. Performance by Player Segment:
+   segment_1:
+     Size: 2,444 players
+     Payer rate: 10.7%
+     Avg revenue: $0.43
+     MAE: 0.0471
+     R²: -0.0002
+     AUC: 0.7828
+     Binary Accuracy: 0.8482
+
+   segment_0:
+     Size: 455 players
+     Payer rate: 30.8%
+     Avg revenue: $0.48
+     MAE: 0.1515
+     R²: 0.0014
+     AUC: 0.6833
+     Binary Accuracy: 0.6022
+
+   segment_3:
+     Size: 325 players
+     Payer rate: 16.3%
+     Avg revenue: $0.60
+     MAE: 0.1005
+     R²: 0.0073
+     AUC: 0.6952
+     Binary Accuracy: 0.6554
+
+   segment_4:
+     Size: 85 players
+     Payer rate: 42.4%
+     Avg revenue: $0.63
+     MAE: 0.2654
+     R²: -0.0124
+     AUC: 0.7653
+     Binary Accuracy: 0.7529
+
+5. Performance by Revenue Tier:
+   Non Payers:
+     Size: 2,819 players
+     Revenue range: $0.00 - $0.00
+     MAE: 0.0035
+     Avg Payer Probability: 0.0553
+
+   Low Spenders:
+     Size: 246 players
+     Revenue range: $0.00 - $0.02
+     MAE: 0.0042
+     R²: -0.7998
+     Avg Payer Probability: 0.0851
+
+   Medium Spenders:
+     Size: 196 players
+     Revenue range: $0.02 - $0.27
+     MAE: 0.0584
+     R²: -1.0166
+     Avg Payer Probability: 0.1847
+
+   High Spenders:
+     Size: 49 players
+     Revenue range: $0.27 - $49.99
+     MAE: 4.3959
+     R²: -0.3080
+     Avg Payer Probability: 0.2650
+
+8. Model Performance Summary:
+   Overall Assessment:
+   - Revenue Prediction: Very Poor (R² = -0.028)
+   - Payer Identification: Fair (AUC = 0.756)
+   - Business Impact: Low (2.3x lift for top 10%)
+
+9. Recommendations:
+   - Consider additional feature engineering or external data sources
+   - Use model for targeting top predicted players
+   - Implement A/B testing to validate business impact
+   - Monitor model performance over time for drift

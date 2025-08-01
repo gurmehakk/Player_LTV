@@ -2,6 +2,29 @@
 
 A comprehensive Player Lifetime Value (pLTV) prediction system that combines BigQuery data extraction with ExpLTV methodology, whale detection, and comprehensive backtesting.
 
+## Quick Start
+
+Run the LTV prediction pipeline with different options:
+
+```bash
+# Run without SMOTE (default)
+python run_pipeline.py
+
+# Run with SMOTE for class imbalance handling  
+python run_pipeline.py smote
+
+# Compare both approaches
+python run_pipeline.py compare
+```
+
+## What the System Does
+
+- **Observation Period**: Uses 3 days of player behavior (May 28-31, 2025)
+- **Prediction Period**: Predicts 30 days of future LTV (June 2025)
+- **Features**: Creates 45+ behavioral features from session and event data
+- **Model**: Neural network with whale detection and expert routing
+- **SMOTE**: Optional class imbalance handling for better minority class prediction
+
 ## Features
 
 - **BigQuery Data Extraction**: Comprehensive feature extraction from app_data table

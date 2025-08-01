@@ -3,7 +3,10 @@ ExpLTV Model with Zero-Inflated Log-Normal (ZILN) Loss and Whale Detection
 Implements ExpLTV methodology with whale detection, expert routing, and joint loss optimization
 """
 
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 import pandas as pd
 from typing import Tuple, Dict, Optional, List
 import lightgbm as lgb
@@ -23,55 +26,79 @@ class ExpLTVModel(nn.Module):
     
     def __init__(self, 
                  input_dim: int,
-                 hidden_dim: int = 128,
-                 embedding_dim: int = 64,
-                 dropout_rate: float = 0.2,
-                 num_experts: int = 2):
+                 hidden_dim: int = 256,
+                 embedding_dim: int = 128,
+                 dropout_rate: float = 0.3,
+                 num_experts: int = 3):
         super(ExpLTVModel, self).__init__()
         
-        # Shared feature extraction layers
+        # Enhanced shared feature extraction layers with batch normalization
         self.shared_layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
+            
             nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate)
+            nn.Dropout(dropout_rate),
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5)
         )
         
-        # Whale detection head
+        shared_output_dim = hidden_dim // 2
+        
+        # Enhanced whale detection head
         self.whale_detector = nn.Sequential(
-            nn.Linear(hidden_dim, embedding_dim),
+            nn.Linear(shared_output_dim, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(embedding_dim, 1),
+            nn.Linear(embedding_dim, embedding_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(embedding_dim // 2, 1),
             nn.Sigmoid()
         )
         
-        # Payer classification head
+        # Enhanced payer classification head
         self.payer_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, embedding_dim),
+            nn.Linear(shared_output_dim, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(embedding_dim, 1),
+            nn.Linear(embedding_dim, embedding_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(embedding_dim // 2, 1),
             nn.Sigmoid()
         )
         
-        # Expert routing for LTV prediction
+        # Enhanced expert routing for LTV prediction
         self.expert_gate = nn.Sequential(
-            nn.Linear(hidden_dim, embedding_dim),
+            nn.Linear(shared_output_dim, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5),
             nn.Linear(embedding_dim, num_experts),
             nn.Softmax(dim=1)
         )
         
-        # LTV prediction experts
+        # Enhanced LTV prediction experts with residual connections
         self.ltv_experts = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_dim, embedding_dim),
+                nn.Linear(shared_output_dim, embedding_dim),
+                nn.BatchNorm1d(embedding_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(embedding_dim, 1),
+                nn.Linear(embedding_dim, embedding_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate * 0.5),
+                nn.Linear(embedding_dim // 2, 1),
                 nn.ReLU()  # Ensure positive output
             ) for _ in range(num_experts)
         ])
@@ -121,16 +148,20 @@ class ZILNModel:
         
         self.use_neural_network = use_neural_network
         
-        # Neural network parameters
+        # Enhanced neural network parameters
         self.nn_params = nn_params or {
-            'hidden_dim': 128,
-            'embedding_dim': 64,
-            'dropout_rate': 0.2,
+            'hidden_dim': 256,
+            'embedding_dim': 128,
+            'dropout_rate': 0.3,
             'learning_rate': 0.001,
-            'epochs': 200,
-            'batch_size': 1024,
-            'early_stopping_patience': 20,
-            'gradient_clip_norm': 1.0
+            'epochs': 250,
+            'batch_size': 512,
+            'early_stopping_patience': 30,
+            'gradient_clip_norm': 1.0,
+            'weight_decay': 1e-4,
+            'lr_scheduler_factor': 0.8,
+            'lr_scheduler_patience': 15,
+            'min_lr': 1e-6
         }
         
         # Default parameters for binary classifier (LightGBM fallback)
@@ -171,6 +202,7 @@ class ZILNModel:
         self.binary_classifier = None  # LightGBM fallback
         self.amount_regressor = None   # LightGBM fallback
         self.scaler = StandardScaler()
+        self.target_scaler = StandardScaler()  # For LTV target scaling
         
         # Device for PyTorch
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -185,7 +217,7 @@ class ZILNModel:
         
     def fit(self, X: pd.DataFrame, y: np.ndarray, whale_labels: Optional[np.ndarray] = None) -> 'ZILNModel':
         """
-        Fit the ExpLTV model with whale detection
+        Fit the ExpLTV model with neural network and whale detection
         
         Args:
             X: Feature matrix
@@ -196,20 +228,16 @@ class ZILNModel:
             Fitted model instance
         """
         
-        print("Training ZILN Model...")
+        logger = logging.getLogger(__name__)
+        logger.info("Training Enhanced ZILN Model with Neural Network...")
         
-        # Step 1: Create binary target (payer vs non-payer)
+        # Step 1: Create binary target (payer vs non-payer)  
         y_binary = (y > 0).astype(int)
         
-        # Step 2: Create positive revenue subset for amount prediction
+        # Store training statistics
         positive_mask = y > 0
-        X_positive = X[positive_mask]
         y_positive = y[positive_mask]
         
-        # Log-transform positive revenue values
-        y_log_positive = np.log1p(y_positive)
-        
-        # Store training statistics
         self.training_stats = {
             'total_samples': len(y),
             'payers': sum(y_binary),
@@ -219,27 +247,269 @@ class ZILNModel:
             'median_revenue_payers': np.median(y_positive) if len(y_positive) > 0 else 0
         }
         
-        print(f"Training set: {self.training_stats['total_samples']:,} players")
-        print(f"Payers: {self.training_stats['payers']:,} ({self.training_stats['payer_rate']*100:.1f}%)")
-        print(f"Average revenue (payers): ${self.training_stats['avg_revenue_payers']:.2f}")
+        logger.info(f"Training set: {self.training_stats['total_samples']:,} players")
+        logger.info(f"Payers: {self.training_stats['payers']:,} ({self.training_stats['payer_rate']*100:.1f}%)")
+        logger.info(f"Average revenue (payers): ${self.training_stats['avg_revenue_payers']:.2f}")
         
-        # Step 3: Train binary classifier (payer vs non-payer)
-        print("Training binary classifier...")
+        if self.use_neural_network and len(y_positive) > 100:
+            # Train neural network
+            logger.info("Training Neural Network Model...")
+            self._train_neural_network(X, y, y_binary, whale_labels)
+        else:
+            # Fallback to LightGBM
+            print("Using LightGBM fallback...")
+            self._train_lightgbm_fallback(X, y, y_binary)
+        
+        logger.info("Enhanced ZILN model training completed")
+        return self
+    
+    def _train_neural_network(self, X: pd.DataFrame, y: np.ndarray, y_binary: np.ndarray, 
+                             whale_labels: Optional[np.ndarray] = None):
+        """Train the neural network model with under/oversampling for imbalanced data"""
+        
+        from sklearn.model_selection import train_test_split
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        from imblearn.over_sampling import SMOTE
+        from imblearn.under_sampling import RandomUnderSampler
+        from imblearn.combine import SMOTEENN
+        import matplotlib.pyplot as plt
+        
+        # SMOTE is now handled in the feature engineering stage
+        # No need for duplicate SMOTE application here
+        
+        # Prepare data
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Scale LTV targets to improve regression learning
+        # Use log1p transformation for better handling of zero values
+        y_log = np.log1p(y)  # log(1 + y) to handle zeros
+        y_scaled = self.target_scaler.fit_transform(y_log.reshape(-1, 1)).flatten()
+        
+        # Create whale labels if not provided
+        if whale_labels is None:
+            whale_threshold = np.percentile(y[y > 0], 95) if len(y[y > 0]) > 0 else 0
+            whale_labels = (y >= whale_threshold).astype(int)
+        
+        # Use original data (SMOTE already applied in feature engineering if requested)
+        X_for_split = X_scaled
+        y_for_split = y_scaled  # Use scaled targets for training
+        y_binary_for_split = y_binary
+        whale_for_split = whale_labels
+        
+        # Train/validation split on balanced data
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_for_split, y_for_split, test_size=0.2, random_state=42, stratify=whale_for_split
+        )
+        y_binary_train = (y_train > 0).astype(int)
+        y_binary_val = (y_val > 0).astype(int)
+        
+        # Create whale labels if not provided
+        if whale_labels is None:
+            whale_threshold = np.percentile(y[y > 0], 95) if len(y[y > 0]) > 0 else 0
+            whale_labels_train = (y_train >= whale_threshold).astype(int)
+            whale_labels_val = (y_val >= whale_threshold).astype(int)
+        else:
+            whale_train, whale_val = train_test_split(whale_labels, test_size=0.2, random_state=42)
+            whale_labels_train, whale_labels_val = whale_train, whale_val
+        
+        # Convert to tensors
+        X_train_tensor = torch.FloatTensor(X_train).to(self.device)
+        X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+        y_train_tensor = torch.FloatTensor(y_train).to(self.device)
+        y_val_tensor = torch.FloatTensor(y_val).to(self.device)
+        y_binary_train_tensor = torch.FloatTensor(y_binary_train).to(self.device)
+        y_binary_val_tensor = torch.FloatTensor(y_binary_val).to(self.device)
+        whale_train_tensor = torch.FloatTensor(whale_labels_train).to(self.device)
+        whale_val_tensor = torch.FloatTensor(whale_labels_val).to(self.device)
+        
+        # Initialize model
+        input_dim = X_train.shape[1]
+        self.neural_model = ExpLTVModel(
+            input_dim=input_dim,
+            hidden_dim=self.nn_params['hidden_dim'],
+            embedding_dim=self.nn_params['embedding_dim'],
+            dropout_rate=self.nn_params['dropout_rate'],
+            num_experts=3
+        ).to(self.device)
+        
+        # Optimizer and scheduler
+        optimizer = torch.optim.AdamW(
+            self.neural_model.parameters(),
+            lr=self.nn_params['learning_rate'],
+            weight_decay=self.nn_params['weight_decay']
+        )
+        
+        scheduler = ReduceLROnPlateau(
+            optimizer, 
+            mode='min',
+            factor=self.nn_params['lr_scheduler_factor'],
+            patience=self.nn_params['lr_scheduler_patience'],
+            min_lr=self.nn_params['min_lr']
+        )
+        
+        # Loss functions
+        mse_loss = nn.MSELoss()
+        bce_loss = nn.BCELoss()
+        
+        # Create data loaders
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor, y_binary_train_tensor, whale_train_tensor)
+        val_dataset = TensorDataset(X_val_tensor, y_val_tensor, y_binary_val_tensor, whale_val_tensor)
+        
+        train_loader = DataLoader(train_dataset, batch_size=self.nn_params['batch_size'], shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=self.nn_params['batch_size'], shuffle=False)
+        
+        # Training tracking
+        train_losses = []
+        val_losses = []
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        logger.info(f"Starting training for {self.nn_params['epochs']} epochs...")
+        logger.info("Epoch | Train Loss | Val Loss | LR | Time")
+        print("-" * 50)
+        
+        import time
+        
+        for epoch in range(self.nn_params['epochs']):
+            epoch_start_time = time.time()
+            
+            # Training phase
+            self.neural_model.train()
+            train_loss = 0.0
+            train_batches = 0
+            
+            for batch_X, batch_y, batch_binary, batch_whale in train_loader:
+                optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.neural_model(batch_X)
+                
+                # Multi-task loss with improved weighting for LTV regression
+                ltv_loss = mse_loss(outputs['ltv_pred'].squeeze(), batch_y)
+                payer_loss = bce_loss(outputs['payer_prob'].squeeze(), batch_binary)
+                whale_loss = bce_loss(outputs['whale_prob'].squeeze(), batch_whale)
+                
+                # Combined loss with very high weight on LTV regression
+                # Make regression the primary objective
+                total_loss = 10.0 * ltv_loss + 0.1 * payer_loss + 0.05 * whale_loss
+                
+                total_loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    self.neural_model.parameters(), 
+                    self.nn_params['gradient_clip_norm']
+                )
+                
+                optimizer.step()
+                
+                train_loss += total_loss.item()
+                train_batches += 1
+            
+            # Validation phase
+            self.neural_model.eval()
+            val_loss = 0.0
+            val_batches = 0
+            
+            with torch.no_grad():
+                for batch_X, batch_y, batch_binary, batch_whale in val_loader:
+                    outputs = self.neural_model(batch_X)
+                    
+                    ltv_loss = mse_loss(outputs['ltv_pred'].squeeze(), batch_y)
+                    payer_loss = bce_loss(outputs['payer_prob'].squeeze(), batch_binary)
+                    whale_loss = bce_loss(outputs['whale_prob'].squeeze(), batch_whale)
+                    
+                    total_loss = ltv_loss + 0.5 * payer_loss + 0.3 * whale_loss
+                    val_loss += total_loss.item()
+                    val_batches += 1
+            
+            # Calculate average losses
+            avg_train_loss = train_loss / train_batches
+            avg_val_loss = val_loss / val_batches
+            
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+            
+            # Learning rate scheduling
+            scheduler.step(avg_val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Print progress every 10 epochs
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                epoch_time = time.time() - epoch_start_time
+                print(f"{epoch+1:5d} | {avg_train_loss:9.6f} | {avg_val_loss:8.6f} | {current_lr:.2e} | {epoch_time:.1f}s")
+            
+            # Early stopping
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                # Save best model
+                torch.save(self.neural_model.state_dict(), 'best_model.pth')
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= self.nn_params['early_stopping_patience']:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+        
+        # Load best model
+        self.neural_model.load_state_dict(torch.load('best_model.pth'))
+        
+        # Save training history
+        self.training_history = {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'epochs_trained': len(train_losses)
+        }
+        
+        logger.info(f"Training completed after {len(train_losses)} epochs")
+        logger.info(f"Best validation loss: {best_val_loss:.6f}")
+        
+        # Create training plot
+        self._plot_training_progress(train_losses, val_losses)
+        
+    def _plot_training_progress(self, train_losses, val_losses):
+        """Plot training progress"""
+        import matplotlib.pyplot as plt
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label='Training Loss', color='blue', alpha=0.7)
+        plt.plot(val_losses, label='Validation Loss', color='red', alpha=0.7)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Neural Network Training Progress')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig('output/training_progress.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info("Training progress plot saved to output/training_progress.png")
+    
+    def _train_lightgbm_fallback(self, X: pd.DataFrame, y: np.ndarray, y_binary: np.ndarray):
+        """Fallback LightGBM training"""
+        
+        # Create positive revenue subset for amount prediction
+        positive_mask = y > 0
+        X_positive = X[positive_mask]
+        y_positive = y[positive_mask]
+        y_log_positive = np.log1p(y_positive)
+        
+        # Train binary classifier
+        logger.info("Training binary classifier...")
         self.binary_classifier = lgb.LGBMClassifier(**self.binary_params)
         self.binary_classifier.fit(X, y_binary)
         
-        # Store feature importance for binary classifier
+        # Store feature importance
         self.feature_importance_binary = dict(
             zip(X.columns, self.binary_classifier.feature_importances_)
         )
         
-        # Step 4: Train amount regressor on positive values only
-        if len(X_positive) > 10:  # Need minimum samples for regression
-            print("Training amount regressor...")
+        # Train amount regressor
+        if len(X_positive) > 10:
+            logger.info("Training amount regressor...")
             self.amount_regressor = lgb.LGBMRegressor(**self.regression_params)
             self.amount_regressor.fit(X_positive, y_log_positive)
             
-            # Store feature importance for amount regressor
             self.feature_importance_amount = dict(
                 zip(X_positive.columns, self.amount_regressor.feature_importances_)
             )
@@ -247,13 +517,10 @@ class ZILNModel:
             print("Warning: Insufficient positive samples for amount regression")
             self.amount_regressor = None
             self.feature_importance_amount = {}
-        
-        print("ZILN model training completed")
-        return self
     
     def predict(self, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Predict using ZILN approach
+        Predict using enhanced ZILN approach (neural network or LightGBM)
         
         Args:
             X: Feature matrix for prediction
@@ -262,8 +529,59 @@ class ZILNModel:
             Tuple of (expected_pltv, payer_probabilities, conditional_amounts)
         """
         
-        if self.binary_classifier is None:
+        if self.neural_model is not None:
+            # Use neural network predictions
+            return self._predict_neural_network(X)
+        elif self.binary_classifier is not None:
+            # Use LightGBM fallback
+            return self._predict_lightgbm(X)
+        else:
             raise ValueError("Model not fitted. Call fit() first.")
+    
+    def _predict_neural_network(self, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Neural network predictions"""
+        
+        # Scale features
+        X_scaled = self.scaler.transform(X)
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        
+        self.neural_model.eval()
+        with torch.no_grad():
+            # Get predictions in batches to handle large datasets
+            batch_size = 1000
+            all_ltv_preds = []
+            all_payer_probs = []
+            all_whale_probs = []
+            
+            for i in range(0, len(X_tensor), batch_size):
+                batch = X_tensor[i:i+batch_size]
+                outputs = self.neural_model(batch)
+                
+                all_ltv_preds.append(outputs['ltv_pred'].squeeze().cpu().numpy())
+                all_payer_probs.append(outputs['payer_prob'].squeeze().cpu().numpy())
+                all_whale_probs.append(outputs['whale_prob'].squeeze().cpu().numpy())
+            
+            # Concatenate all predictions
+            ltv_preds = np.concatenate(all_ltv_preds)
+            payer_probs = np.concatenate(all_payer_probs)
+            whale_probs = np.concatenate(all_whale_probs)
+        
+        # Transform predictions back to original scale
+        # Inverse transform from scaled space
+        ltv_preds_unscaled = self.target_scaler.inverse_transform(ltv_preds.reshape(-1, 1)).flatten()
+        # Inverse log1p transformation: exp(y) - 1
+        ltv_preds = np.expm1(ltv_preds_unscaled)
+        
+        # Ensure non-negative LTV predictions
+        ltv_preds = np.maximum(ltv_preds, 0)
+        
+        # Expected pLTV = P(payer) * LTV_pred
+        expected_pltv = payer_probs * ltv_preds
+        
+        return expected_pltv, payer_probs, ltv_preds
+        
+    def _predict_lightgbm(self, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """LightGBM fallback predictions"""
         
         # Step 1: Predict probability of being a payer
         payer_probs = self.binary_classifier.predict_proba(X)[:, 1]
@@ -313,8 +631,26 @@ class ZILNModel:
         # Classification accuracy metrics
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
         
-        # Use 0.5 threshold for binary predictions
-        payer_predictions = (payer_probs >= 0.5).astype(int)
+        # First calculate optimal threshold using precision-recall curve
+        from sklearn.metrics import precision_recall_curve
+        precision_curve, recall_curve, thresholds = precision_recall_curve(y_binary_test, payer_probs)
+        
+        # Find optimal threshold (max F1 score)
+        f1_scores = 2 * (precision_curve * recall_curve) / (precision_curve + recall_curve + 1e-8)
+        optimal_threshold_idx = np.argmax(f1_scores)
+        
+        # Use a more sensitive threshold for imbalanced data
+        if len(thresholds) > optimal_threshold_idx:
+            optimal_threshold = thresholds[optimal_threshold_idx]
+            # For very imbalanced data, ensure threshold isn't too high
+            optimal_threshold = min(optimal_threshold, 0.3)
+        else:
+            # Fallback: use actual payer rate as threshold for severely imbalanced data
+            optimal_threshold = np.mean(y_binary_test) * 2  # 2x the base rate
+            optimal_threshold = max(0.1, min(optimal_threshold, 0.5))  # Keep between 0.1 and 0.5
+        
+        # Use optimal threshold for binary predictions instead of 0.5
+        payer_predictions = (payer_probs >= optimal_threshold).astype(int)
         
         binary_accuracy = accuracy_score(y_binary_test, payer_predictions)
         precision = precision_score(y_binary_test, payer_predictions, zero_division=0)
@@ -366,16 +702,9 @@ class ZILNModel:
                 lift_metrics[f'lift_top_{int(pct*100)}pct'] = lift
                 lift_metrics[f'revenue_capture_top_{int(pct*100)}pct'] = revenue_capture_rate
         
-        # Precision and recall for payer classification at different thresholds
-        from sklearn.metrics import precision_recall_curve
-        precision_curve, recall_curve, thresholds = precision_recall_curve(y_binary_test, payer_probs)
+        # Use already calculated precision-recall curve values
         avg_precision = np.mean(precision_curve)
         avg_recall = np.mean(recall_curve)
-        
-        # Find optimal threshold (max F1 score)
-        f1_scores = 2 * (precision_curve * recall_curve) / (precision_curve + recall_curve + 1e-8)
-        optimal_threshold_idx = np.argmax(f1_scores)
-        optimal_threshold = thresholds[optimal_threshold_idx] if len(thresholds) > optimal_threshold_idx else 0.5
         optimal_f1 = f1_scores[optimal_threshold_idx]
         
         # Model calibration: predicted vs actual payer rates

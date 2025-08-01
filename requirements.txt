@@ -7,7 +7,9 @@ scipy>=1.9.0
 scikit-learn>=1.2.0
 xgboost>=1.6.0
 # Note: LightGBM might have issues on macOS, use XGBoost as alternative
-lightgbm>=3.3.0\ntorch>=1.13.0
+lightgbm>=3.3.0
+torch>=1.13.0
+imbalanced-learn>=0.10.0
 
 # Google Cloud Libraries
 google-cloud-bigquery>=3.4.0

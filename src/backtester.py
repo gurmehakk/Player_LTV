@@ -3,6 +3,7 @@ Backtesting and validation module for pLTV models
 Implements time-based splits and comprehensive validation
 """
 
+import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -45,38 +46,40 @@ class BackTester:
             Dictionary containing all backtest results
         """
         
-        print("Starting comprehensive backtesting...")
+        logger = logging.getLogger(__name__)
+        logger.info("Starting comprehensive backtesting...")
         
         # Prepare data - Use LTV target instead of historical revenue
-        X = feature_engineer.get_feature_matrix(data)
+        # For backtesting, we want to use original data (not SMOTE-resampled)
+        X = feature_engineer.get_feature_matrix(data, apply_smote=False)
         y = data['ltv_target'].values  # This is the future LTV we want to predict
         
         # 1. Random split validation
-        print("1. Random split validation...")
+        logger.info("Running random split validation...")
         random_results = self._random_split_validation(X, y, model)
         
         # 2. Time-based split validation (if timestamp available)
         time_results = {}
         if 'first_session_timestamp' in data.columns:
-            print("2. Time-based split validation...")
+            logger.info("Running time-based split validation...")
             time_results = self._time_based_validation(data, X, y, model, feature_engineer)
         
         # 3. Cross-validation
-        print("3. Cross-validation...")
+        logger.info("Running cross-validation...")
         cv_results = self._cross_validation(X, y, model)
         
         # 4. Segment-based validation
-        print("4. Segment-based validation...")
+        logger.info("Running segment-based validation...")
         segment_results = self._segment_based_validation(data, X, y, model)
         
         # 5. Revenue tier validation
-        print("5. Revenue tier validation...")
+        logger.info("Running revenue tier validation...")
         tier_results = self._revenue_tier_validation(data, X, y, model)
         
         # 6. Whale detection validation (if enabled)
         whale_results = {}
         if include_whale_validation:
-            print("6. Whale detection validation...")
+            logger.info("Running whale detection validation...")
             whale_results = self._whale_detection_validation(data, X, y, model, feature_engineer)
         
         # Compile results
@@ -91,7 +94,7 @@ class BackTester:
             'training_stats': model.get_training_stats()
         }
         
-        print("Backtesting completed!")
+        logger.info("Backtesting completed successfully")
         return backtest_results
     
     def _random_split_validation(self, 
@@ -148,8 +151,8 @@ class BackTester:
         test_data = data_sorted.iloc[split_idx:]
         
         # Get corresponding features and targets - Use LTV target
-        X_train = feature_engineer.get_feature_matrix(train_data)
-        X_test = feature_engineer.get_feature_matrix(test_data)
+        X_train = feature_engineer.get_feature_matrix(train_data, apply_smote=False)
+        X_test = feature_engineer.get_feature_matrix(test_data, apply_smote=False)
         y_train = train_data['ltv_target'].values  # Future LTV prediction
         y_test = test_data['ltv_target'].values    # Future LTV prediction
         
@@ -566,7 +569,8 @@ class BackTester:
         with open(filepath, 'w') as f:
             f.write(report)
         
-        print(f"Validation report saved to: {filepath}")
+        logger = logging.getLogger(__name__)
+        logger.info(f"Validation report saved to: {filepath}")
     
     def get_model_stability_metrics(self, results: Dict[str, Any]) -> Dict[str, float]:
         """Calculate model stability metrics across different validation approaches"""

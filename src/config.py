@@ -70,6 +70,29 @@ class Config:
         with open(config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
     
+    def get(self, key: str, default=None):
+        """Get configuration value with dot notation support"""
+        keys = key.split('.')
+        value = self
+        
+        try:
+            for k in keys:
+                if hasattr(value, k):
+                    value = getattr(value, k)
+                else:
+                    return default
+            return value
+        except (AttributeError, KeyError):
+            return default
+    
+    @property
+    def config(self):
+        """Return configuration as dictionary"""
+        return {
+            key: value for key, value in self.__dict__.items()
+            if not key.startswith('_')
+        }
+    
     @property
     def full_table_id(self):
         """Get full BigQuery table ID"""

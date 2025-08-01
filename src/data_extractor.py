@@ -36,9 +36,10 @@ class DataExtractor:
             min_total_days: Minimum total days of data needed (90)
         """
         
-        observation_start = "2025-03-01"
-        observation_end = "2025-05-01"
-        prediction_end = "2025-06-01"
+        # SIMPLE 3-DAY OBSERVATION: Last 3 days of May for observation, June for prediction
+        observation_start = "2025-05-28"  # 3 days before May 31
+        observation_end = "2025-05-31"    # End of May
+        prediction_end = "2025-06-30"     # End of June (1 month prediction)
         
         query = f"""
         WITH base_data AS (

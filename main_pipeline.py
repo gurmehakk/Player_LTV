@@ -49,24 +49,24 @@ class ExpLTVPipeline:
         
         # Initialize components
         self.data_extractor = DataExtractor(
-            project_id=self.config.get('bigquery.project_id', 'gc-forecasting-dev'),
-            credentials_path=self.config.get('bigquery.credentials_path')
+            project_id=self.config.project_id,
+            credentials_path=self.config.credentials_path
         )
         
         self.feature_engineer = FeatureEngineer()
         self.model = ZILNModel(
-            use_neural_network=self.config.get('model.use_neural_network', True),
-            nn_params=self.config.get('model.nn_params')
+            use_neural_network=True,  # Force neural network usage
+            nn_params=None  # Use defaults
         )
         self.backtester = BackTester(
-            test_size=self.config.get('training.test_size', 0.2),
-            n_splits=self.config.get('training.cv_folds', 5),
-            random_state=self.config.get('training.random_state', 42)
+            test_size=self.config.test_size,
+            n_splits=5,
+            random_state=self.config.random_state
         )
         self.visualizer = ResultVisualizer()
         
         # Create output directory
-        self.output_dir = self.config.get('outputs.output_dir', 'output')
+        self.output_dir = self.config.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
         logger.info(f"Pipeline initialized. Output directory: {self.output_dir}")
@@ -78,7 +78,7 @@ class ExpLTVPipeline:
         
         pipeline_results = {
             'start_time': datetime.now(),
-            'config': self.config.config,
+            'config': self.config.__dict__,
             'data_extraction': {},
             'feature_engineering': {},
             'user_categorization': {},
@@ -115,7 +115,7 @@ class ExpLTVPipeline:
             categorized_data = self._categorize_users(engineered_data)
             pipeline_results['user_categorization'] = {
                 'status': 'success',
-                'category_distribution': categorized_data['user_category'].value_counts().to_dict()
+                'category_distribution': categorized_data['future_user_category'].value_counts().to_dict()
             }
             
             # Step 4: Model Training
@@ -151,8 +151,12 @@ class ExpLTVPipeline:
                 metrics = backtest_results['random_split']['metrics']
                 pipeline_results['final_metrics'] = {
                     'r2_score': metrics.get('r2', 0),
+                    'rmse': metrics.get('rmse', 0),
                     'auc_payer_classification': metrics.get('auc_payer_classification', 0),
                     'f1_score': metrics.get('f1_score', 0),
+                    'precision': metrics.get('precision', 0),
+                    'recall': metrics.get('recall', 0),
+                    'accuracy': metrics.get('binary_accuracy', 0),  # Fixed key name
                     'lift_top_10pct': metrics.get('lift_top_10pct', 1),
                     'revenue_capture_top_10pct': metrics.get('revenue_capture_top_10pct', 0)
                 }
@@ -175,8 +179,7 @@ class ExpLTVPipeline:
     def _extract_data(self) -> pd.DataFrame:
         """Extract data from BigQuery"""
         
-        lookback_days = self.config.get('bigquery.lookback_days', 90)
-        data = self.data_extractor.extract_player_data(days_lookback=lookback_days)
+        data = self.data_extractor.extract_player_data()
         
         if len(data) == 0:
             raise ValueError("No data extracted from BigQuery")
@@ -197,7 +200,7 @@ class ExpLTVPipeline:
         
         categorized_data = self.feature_engineer.create_user_categories(data)
         
-        category_counts = categorized_data['user_category'].value_counts()
+        category_counts = categorized_data['future_user_category'].value_counts()
         logger.info(f"User categorization complete: {dict(category_counts)}")
         
         return categorized_data
@@ -205,12 +208,40 @@ class ExpLTVPipeline:
     def _train_model(self, data: pd.DataFrame) -> ZILNModel:
         """Train the ExpLTV model"""
         
-        # Prepare training data
-        X = self.feature_engineer.get_feature_matrix(data)
-        y = data['total_revenue'].values
+        # Prepare training data - Apply SMOTE if enabled
+        X_data = self.feature_engineer.get_feature_matrix(data)
         
-        # Create whale labels
-        whale_labels = (data['user_category'] == 'Whale').astype(int).values
+        # If SMOTE is enabled and was applied, X_data will include ltv_target
+        if hasattr(self.feature_engineer, 'use_smote') and self.feature_engineer.use_smote and 'ltv_target' in X_data.columns:
+            y = X_data['ltv_target'].values
+            X = X_data.drop('ltv_target', axis=1)
+            logger.info(f"Using SMOTE-resampled data: {len(X)} samples")
+        else:
+            X = X_data
+            y = data['ltv_target'].values  # Use LTV target, not historical revenue
+        
+        # Create whale labels based on future LTV
+        if hasattr(self.feature_engineer, 'use_smote') and self.feature_engineer.use_smote and 'ltv_target' in X_data.columns:
+            # For SMOTE data, create whale labels from resampled LTV values
+            whale_threshold = np.percentile(y[y > 0], 95) if len(y[y > 0]) > 0 else 0
+            whale_labels = (y >= whale_threshold).astype(int)
+            logger.info(f"Created whale labels for SMOTE data: {len(whale_labels)} labels, {whale_labels.sum()} whales")
+        elif 'future_user_category' in data.columns:
+            whale_labels = (data['future_user_category'] == 'Whale').astype(int).values
+            # If SMOTE was applied but we don't have resampled categories, extend whale labels
+            if len(X) != len(whale_labels):
+                logger.warning(f"Mismatch: X has {len(X)} samples, whale_labels has {len(whale_labels)}. Creating new whale labels from LTV.")
+                whale_threshold = np.percentile(y[y > 0], 95) if len(y[y > 0]) > 0 else 0
+                whale_labels = (y >= whale_threshold).astype(int)
+        else:
+            # Fallback: create whale labels from LTV target
+            whale_threshold = np.percentile(y[y > 0], 95) if len(y[y > 0]) > 0 else 0
+            whale_labels = (y >= whale_threshold).astype(int)
+        
+        # Final safety check for sample size consistency
+        if len(X) != len(y) or len(X) != len(whale_labels):
+            logger.error(f"Sample size mismatch: X={len(X)}, y={len(y)}, whale_labels={len(whale_labels)}")
+            raise ValueError(f"Inconsistent sample sizes: X={len(X)}, y={len(y)}, whale_labels={len(whale_labels)}")
         
         # Train model
         self.model.fit(X, y, whale_labels=whale_labels)
@@ -238,8 +269,7 @@ class ExpLTVPipeline:
         self.visualizer.create_all_plots(
             data=data,
             backtest_results=backtest_results,
-            save_dir=self.output_dir,
-            include_whale_analysis=True
+            save_dir=self.output_dir
         )
         
         # Create whale analysis dashboard
@@ -253,7 +283,7 @@ class ExpLTVPipeline:
         """Save all results and engineered data"""
         
         # Save engineered data
-        if self.config.get('outputs.save_engineered_data', True):
+        if self.config.save_enhanced_data:
             engineered_data_path = os.path.join(self.output_dir, 'engineered_data.csv')
             data.to_csv(engineered_data_path, index=False)
             logger.info(f"Engineered data saved to {engineered_data_path}")
@@ -303,43 +333,37 @@ class ExpLTVPipeline:
 def main():
     """Main execution function"""
     
-    print("="*60)
-    print("ExpLTV Production Pipeline")
-    print("Player Lifetime Value Prediction with Whale Detection")
-    print("="*60)
+    logger.info("Starting ExpLTV Production Pipeline")
+    logger.info("Player Lifetime Value Prediction with Whale Detection")
     
     try:
         # Initialize and run pipeline
         pipeline = ExpLTVPipeline()
         results = pipeline.run_complete_pipeline()
         
-        # Print summary
-        print("\\n" + "="*60)
-        print("PIPELINE EXECUTION SUMMARY")
-        print("="*60)
-        print(f"Status: SUCCESS")
-        print(f"Duration: {results['duration_minutes']:.1f} minutes")
-        print(f"Total Players: {results['data_extraction']['total_players']:,}")
-        print(f"Payer Rate: {results['data_extraction']['payer_rate']*100:.1f}%")
-        print(f"Total Features: {results['feature_engineering']['total_features']}")
+        # Log execution summary
+        logger.info("Pipeline execution completed successfully")
+        logger.info(f"Duration: {results['duration_minutes']:.1f} minutes")
+        logger.info(f"Total Players: {results['data_extraction']['total_players']:,}")
+        logger.info(f"Payer Rate: {results['data_extraction']['payer_rate']*100:.1f}%")
+        logger.info(f"Total Features: {results['feature_engineering']['total_features']}")
         
         if 'final_metrics' in results:
             metrics = results['final_metrics']
-            print(f"\\nModel Performance:")
-            print(f"  R² Score: {metrics['r2_score']:.4f}")
-            print(f"  AUC (Payer Classification): {metrics['auc_payer_classification']:.4f}")
-            print(f"  F1 Score: {metrics['f1_score']:.4f}")
-            print(f"  Top 10% Lift: {metrics['lift_top_10pct']:.2f}x")
-            print(f"  Revenue Capture (Top 10%): {metrics['revenue_capture_top_10pct']*100:.1f}%")
+            logger.info("Model Performance Metrics:")
+            logger.info(f"  R² Score: {metrics['r2_score']:.4f}")
+            logger.info(f"  AUC (Payer Classification): {metrics['auc_payer_classification']:.4f}")
+            logger.info(f"  F1 Score: {metrics['f1_score']:.4f}")
+            logger.info(f"  Top 10% Lift: {metrics['lift_top_10pct']:.2f}x")
+            logger.info(f"  Revenue Capture (Top 10%): {metrics['revenue_capture_top_10pct']*100:.1f}%")
         
-        print(f"\\nAll results saved to: {pipeline.output_dir}")
-        print("="*60)
+        logger.info(f"All results saved to: {pipeline.output_dir}")
         
         return results
         
     except Exception as e:
-        print(f"\\nPIPELINE FAILED: {str(e)}")
-        print("Check the log file for detailed error information.")
+        logger.error(f"Pipeline execution failed: {str(e)}")
+        logger.error("Check the log file for detailed error information.")
         raise
 
 

@@ -1,0 +1,58 @@
+{
+  "start_time": "2025-08-01T10:11:13.799281",
+  "config": {},
+  "data_extraction": {
+    "status": "success",
+    "total_players": 3310,
+    "data_shape": [
+      3310,
+      10
+    ],
+    "payer_rate": 0.35619335347432024,
+    "total_revenue": 327.5537
+  },
+  "feature_engineering": {
+    "status": "success",
+    "total_features": 45,
+    "numeric_features": 23,
+    "categorical_features": 22
+  },
+  "user_categorization": {
+    "status": "success",
+    "category_distribution": {
+      "Non-payer": 2819,
+      "Low_Spender": 453,
+      "Medium_Spender": 27,
+      "Whale": 11
+    }
+  },
+  "model_training": {
+    "status": "success",
+    "training_stats": {
+      "total_samples": 3310,
+      "payers": 491,
+      "non_payers": 2819,
+      "payer_rate": 0.14833836858006041,
+      "avg_revenue_payers": 0.4767531568228105,
+      "median_revenue_payers": 0.015300000000000001
+    }
+  },
+  "backtesting": {
+    "status": "success",
+    "validation_methods": [
+      "random_split",
+      "time_based",
+      "cross_validation",
+      "segment_based",
+      "revenue_tier",
+      "whale_detection",
+      "feature_importance",
+      "training_stats"
+    ]
+  },
+  "visualization": {
+    "status": "success",
+    "output_directory": "output"
+  },
+  "final_metrics": {}
+}

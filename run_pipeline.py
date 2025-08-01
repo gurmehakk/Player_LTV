@@ -1,121 +1,120 @@
+#!/usr/bin/env python3
 """
-Simple script to run the ExpLTV pipeline
+Production LTV Prediction Pipeline Runner
+Clean, production-ready entry point for the LTV prediction system
 """
 
 import sys
 import os
-import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
 
-# Add src directory to Python path
+# Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.data_extractor import DataExtractor
-from src.feature_engineer import FeatureEngineer
-from src.ziln_model import ZILNModel
-from src.backtester import BackTester
-from src.visualizer import ResultVisualizer
+from main_pipeline import ExpLTVPipeline
 
-def run_pltv_pipeline():
-    """Run the complete pLTV pipeline"""
+
+def main(use_smote=False):
+    """Run the LTV prediction pipeline
     
-    print("="*60)
-    print("ExpLTV Production Pipeline")
-    print("Player Lifetime Value Prediction with Whale Detection")
-    print("="*60)
+    Args:
+        use_smote: Whether to use SMOTE for handling class imbalance
+    """
+    
+    smote_text = "with SMOTE" if use_smote else "without SMOTE" 
+    print(f"Starting LTV Prediction Pipeline ({smote_text})...")
     
     try:
-        # Initialize components
-        print("\\nInitializing components...")
+        # Initialize and run pipeline
+        pipeline = ExpLTVPipeline()
         
-        data_extractor = DataExtractor(project_id='gc-forecasting-dev')
-        feature_engineer = FeatureEngineer()
-        model = ZILNModel(use_neural_network=True)  # Use LightGBM by default
-        backtester = BackTester()
-        visualizer = ResultVisualizer()
+        # Set SMOTE usage
+        pipeline.feature_engineer.use_smote = use_smote
         
-        # Step 1: Extract data with proper LTV targets
-        print("\\n1. Extracting data from BigQuery...")
-        print("   Using Jan-May observation period and May-June prediction period for LTV")
-        # Use fixed parameters since we're using static dates now
-        raw_data = data_extractor.extract_player_data()
-        print(f"   Extracted {len(raw_data):,} players with LTV targets")
-        print("   Columns include historical features + ltv_target (future revenue)")
-        print(f"   Sample columns: {list(raw_data.columns[:10])}...")
+        # Optimize for faster training
+        pipeline.model.nn_params.update({
+            'epochs': 50,
+            'batch_size': 1024,
+            'hidden_dim': 128,
+            'embedding_dim': 64,
+            'early_stopping_patience': 15
+        })
         
-        os.makedirs('output', exist_ok=True)
-        raw_data.to_csv('output/raw_data.csv', index=False)
-        
-        # Step 2: Engineer features
-        print("\\n2. Engineering features...")
-        engineered_data = feature_engineer.create_features(raw_data)
-        print(f"   Created {len(feature_engineer.feature_columns)} features")
-        
-        engineered_data.to_csv('output/engineered_data.csv', index=False)
-        
-        # Step 3: Create user categories (future-focused for whale detection)
-        print("\\n3. Creating user categories...")
-        categorized_data = feature_engineer.create_user_categories(engineered_data)
-        
-        # Step 4: Train LTV prediction model
-        print("\\n4. Training LTV prediction model...")
-        print("   Target: ltv_target (30-day future revenue)")
-        print("   Features: Based on 90-day observation period only")
-        X = feature_engineer.get_feature_matrix(categorized_data)
-        y = categorized_data['ltv_target'].values  # Use LTV target, not historical revenue
-        whale_labels = categorized_data['will_be_whale'].values  # Future whale prediction
-        
-        model.fit(X, y, whale_labels=whale_labels)
-        print("   Model training completed")
-        
-        # Step 5: Run backtesting
-        print("\\n5. Running backtesting...")
-        backtest_results = backtester.run_backtest(
-            data=categorized_data,
-            model=model,
-            feature_engineer=feature_engineer,
-            include_whale_validation=True
-        )
-        
-        # Step 6: Create visualizations
-        print("\\n6. Creating visualizations...")
-        os.makedirs('output', exist_ok=True)
-        visualizer.create_all_plots(
-            data=categorized_data,
-            backtest_results=backtest_results,
-            save_dir='output'
-        )
-        
-        # Save engineered data
-        print("\\n7. Saving results...")
-        categorized_data.to_csv('output/engineered_data.csv', index=False)
+        # Run complete pipeline
+        results = pipeline.run_complete_pipeline()
         
         # Print summary
-        if 'random_split' in backtest_results:
-            metrics = backtest_results['random_split']['metrics']
-            print("\\n" + "="*60)
-            print("LTV PREDICTION PIPELINE RESULTS")
-            print("="*60)
-            print(f"Total Players: {len(categorized_data):,}")
-            print(f"Observation Period: Jan-May 2025 | Prediction Period: May-Jun 2025")
-            print(f"Historical Payers: {np.sum(categorized_data['total_revenue'] > 0):,}")
-            print(f"Future Payers (LTV > 0): {np.sum(categorized_data['ltv_target'] > 0):,}")
-            print("")
-            print("MODEL PERFORMANCE:")
-            print(f"R² Score (LTV Prediction): {metrics.get('r2', 0):.4f}")
-            print(f"AUC (Future Payer Classification): {metrics.get('auc_payer_classification', 0):.4f}")
-            print(f"F1 Score: {metrics.get('f1_score', 0):.4f}")
-            print(f"Top 10% Lift: {metrics.get('lift_top_10pct', 1):.2f}x")
-            print(f"LTV Capture (Top 10%): {metrics.get('revenue_capture_top_10pct', 0)*100:.1f}%")
-            print(f"\\nResults saved to: output/")
-            print("="*60)
+        print(f"\nPipeline Status: {'SUCCESS' if results.get('status') != 'failed' else 'FAILED'}")
+        print(f"Duration: {results['duration_minutes']:.1f} minutes")
+        print(f"Observation Period: 3 days (May 28-31)")
+        print(f"Prediction Period: 30 days (June 2025)")
+        print(f"Total Players: {results['data_extraction']['total_players']:,}")
+        print(f"Payer Rate: {results['data_extraction']['payer_rate']*100:.1f}%")
+        print(f"SMOTE Applied: {'Yes' if use_smote else 'No'}")
         
-        return backtest_results
+        if 'final_metrics' in results:
+            metrics = results['final_metrics']
+            print(f"\nLTV Prediction Performance:")
+            print(f"R² Score: {metrics['r2_score']:.4f}")
+            print(f"RMSE: ${metrics.get('rmse', 0):.2f}")
+            
+            print(f"\nPayer Classification Performance:")
+            print(f"AUC Score: {metrics['auc_payer_classification']:.4f}")
+            print(f"F1 Score: {metrics['f1_score']:.4f}")
+            print(f"Precision: {metrics.get('precision', 0):.4f}")
+            print(f"Recall: {metrics.get('recall', 0):.4f}")
+            print(f"Accuracy: {metrics.get('accuracy', 0):.4f}")
+        
+        print(f"\nResults saved to: {pipeline.output_dir}")
+        
+        return results
         
     except Exception as e:
-        print(f"\\nERROR: Pipeline failed with error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return None
+        print(f"Pipeline failed: {str(e)}")
+        raise
+
+
+def run_comparison():
+    """Run pipeline with and without SMOTE for comparison"""
+    
+    print("Running LTV Pipeline Comparison: With and Without SMOTE")
+    print("=" * 60)
+    
+    # Run without SMOTE
+    print("\n1. Running WITHOUT SMOTE...")
+    results_no_smote = main(use_smote=False)
+    
+    print("\n" + "=" * 60)
+    
+    # Run with SMOTE
+    print("\n2. Running WITH SMOTE...")
+    results_with_smote = main(use_smote=True)
+    
+    print("\n" + "=" * 60)
+    print("COMPARISON SUMMARY")
+    print("=" * 60)
+    
+    # Compare results
+    if 'final_metrics' in results_no_smote and 'final_metrics' in results_with_smote:
+        no_smote = results_no_smote['final_metrics']
+        with_smote = results_with_smote['final_metrics']
+        
+        print(f"{'Metric':<20} {'No SMOTE':<12} {'With SMOTE':<12} {'Improvement':<12}")
+        print("-" * 60)
+        print(f"{'R² Score':<20} {no_smote['r2_score']:<12.4f} {with_smote['r2_score']:<12.4f} {with_smote['r2_score']-no_smote['r2_score']:+.4f}")
+        print(f"{'AUC Score':<20} {no_smote['auc_payer_classification']:<12.4f} {with_smote['auc_payer_classification']:<12.4f} {with_smote['auc_payer_classification']-no_smote['auc_payer_classification']:+.4f}")
+        print(f"{'F1 Score':<20} {no_smote['f1_score']:<12.4f} {with_smote['f1_score']:<12.4f} {with_smote['f1_score']-no_smote['f1_score']:+.4f}")
+        print(f"{'Precision':<20} {no_smote.get('precision',0):<12.4f} {with_smote.get('precision',0):<12.4f} {with_smote.get('precision',0)-no_smote.get('precision',0):+.4f}")
+        print(f"{'Recall':<20} {no_smote.get('recall',0):<12.4f} {with_smote.get('recall',0):<12.4f} {with_smote.get('recall',0)-no_smote.get('recall',0):+.4f}")
+
 
 if __name__ == "__main__":
-    run_pltv_pipeline()
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "compare":
+        run_comparison()
+    elif len(sys.argv) > 1 and sys.argv[1] == "smote":
+        main(use_smote=True)
+    else:
+        main(use_smote=False)
