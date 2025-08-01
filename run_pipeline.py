@@ -34,11 +34,11 @@ def main(use_smote=False):
         
         # Optimize for faster training
         pipeline.model.nn_params.update({
-            'epochs': 50,
+            'epochs': 500,
             'batch_size': 1024,
-            'hidden_dim': 128,
+            'hidden_dim': 256,
             'embedding_dim': 64,
-            'early_stopping_patience': 15
+            'early_stopping_patience': 100
         })
         
         # Run complete pipeline

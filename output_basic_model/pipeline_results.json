@@ -1,5 +1,5 @@
 {
-  "start_time": "2025-08-01T10:11:13.799281",
+  "start_time": "2025-08-01T12:29:36.840894",
   "config": {},
   "data_extraction": {
     "status": "success",
@@ -9,7 +9,7 @@
       10
     ],
     "payer_rate": 0.35619335347432024,
-    "total_revenue": 327.5537
+    "total_revenue": 327.55370000000005
   },
   "feature_engineering": {
     "status": "success",
@@ -29,11 +29,11 @@
   "model_training": {
     "status": "success",
     "training_stats": {
-      "total_samples": 3310,
-      "payers": 491,
+      "total_samples": 5638,
+      "payers": 2819,
       "non_payers": 2819,
-      "payer_rate": 0.14833836858006041,
-      "avg_revenue_payers": 0.4767531568228105,
+      "payer_rate": 0.5,
+      "avg_revenue_payers": 0.015300000000000006,
       "median_revenue_payers": 0.015300000000000001
     }
   },
@@ -52,7 +52,7 @@
   },
   "visualization": {
     "status": "success",
-    "output_directory": "output"
+    "output_directory": "output_basic_model"
   },
   "final_metrics": {}
 }

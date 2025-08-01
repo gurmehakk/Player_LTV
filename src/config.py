@@ -19,7 +19,7 @@ class Config:
     credentials_path: Optional[str] = None
     
     # Data Parameters
-    days_lookback: int = 90
+    days_lookback: int = 3
     prediction_window: int = 30
     min_sessions_threshold: int = 1
     
@@ -34,7 +34,7 @@ class Config:
     n_clusters: int = 5
     
     # Output Configuration
-    output_dir: str = "output"
+    output_dir: str = "output_basic_model"
     save_plots: bool = True
     save_enhanced_data: bool = True
     

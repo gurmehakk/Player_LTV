@@ -295,7 +295,7 @@ def analyze_ltv_prediction_challenge():
     axes[1,2].set_ylim(0, 1)
     
     plt.tight_layout()
-    plt.savefig('output/ltv_prediction_analysis.png', dpi=150, bbox_inches='tight')
+    plt.savefig('output_basic_model/ltv_prediction_analysis.png', dpi=150, bbox_inches='tight')
     plt.close()
     
     logger.info("📊 Analysis complete! Visualizations saved to 'output/ltv_prediction_analysis.png'")

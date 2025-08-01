@@ -123,7 +123,7 @@ class DataExtractor:
             
 
             # Save raw data to CSV
-            df.to_csv('output/raw_data.csv', index=True)
+            df.to_csv('output_basic_model/raw_data.csv', index=True)
             
             print(f"Extracted {len(df)} players with LTV targets")
             if len(df) > 0:

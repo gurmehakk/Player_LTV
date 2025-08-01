@@ -154,7 +154,7 @@ class ZILNModel:
             'embedding_dim': 128,
             'dropout_rate': 0.3,
             'learning_rate': 0.001,
-            'epochs': 250,
+            'epochs': 500,
             'batch_size': 512,
             'early_stopping_patience': 30,
             'gradient_clip_norm': 1.0,
@@ -481,7 +481,7 @@ class ZILNModel:
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig('output/training_progress.png', dpi=150, bbox_inches='tight')
+        plt.savefig('output_basic_model/training_progress.png', dpi=150, bbox_inches='tight')
         plt.close()
         logger.info("Training progress plot saved to output/training_progress.png")
     
