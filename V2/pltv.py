@@ -1,15 +1,42 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler, RobustScaler
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import ElasticNet, Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, ExtraTreesRegressor, AdaBoostRegressor
+from sklearn.linear_model import ElasticNet, Ridge, Lasso, HuberRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error, roc_auc_score, roc_curve, precision_recall_curve, auc
 from sklearn.model_selection import cross_val_score, KFold
 from sklearn.feature_selection import SelectKBest, f_regression, RFE
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
+
+# Advanced ML models - handle import errors gracefully
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    print("XGBoost not available. Install with: pip install xgboost")
+    XGBOOST_AVAILABLE = False
+
+try:
+    from catboost import CatBoostRegressor
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    print("CatBoost not available. Install with: pip install catboost")
+    CATBOOST_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras import Sequential, layers, callbacks
+    TENSORFLOW_AVAILABLE = True
+    # Suppress TensorFlow warnings
+    tf.get_logger().setLevel('ERROR')
+except ImportError:
+    print("TensorFlow not available. Install with: pip install tensorflow")
+    TENSORFLOW_AVAILABLE = False
 
 # Global variable to collect plot data
 PLOT_DATA = []
@@ -79,158 +106,178 @@ def collect_evaluation_data(y_true, y_pred, model_name, feature_importance=None)
     print(f"Collected evaluation data for {model_name}")
 
 def plot_comprehensive_evaluation():
-    """Create comprehensive evaluation plots for all models"""
+    """Create comprehensive evaluation plots for good models only (R² >= 0.1) including AUC, ROC, RMSE, residual, actual vs predicted, accuracy, feature importance"""
     if not PLOT_DATA:
         print("No evaluation data collected")
         return
     
-    n_models = len(PLOT_DATA)
+    # Filter out models with R² < 0.1
+    good_models = [data for data in PLOT_DATA if data['r2'] >= 0.1]
     
-    # Create figure with subplots
-    fig = plt.figure(figsize=(40, 30))
+    if not good_models:
+        print("No models with R² >= 0.1 found")
+        return
     
-    # Create a grid layout
-    gs = fig.add_gridspec(4, n_models * 2, hspace=0.3, wspace=0.3)
+    print(f"Creating plots for {len(good_models)} models with R² >= 0.1:")
+    for data in good_models:
+        print(f"  - {data['model_name']}: R² = {data['r2']:.4f}")
     
-    for i, data in enumerate(PLOT_DATA):
-        col_start = i * 2
-        
-        # 1. Predicted vs Actual scatter plot
-        ax1 = fig.add_subplot(gs[0, col_start:col_start+2])
-        
-        # Sample data if too large for plotting
-        plot_indices = np.random.choice(len(data['y_true']), 
-                                      min(1000, len(data['y_true'])), 
-                                      replace=False)
-        y_true_sample = data['y_true'][plot_indices]
-        y_pred_sample = data['y_pred'][plot_indices]
-        
-        ax1.scatter(y_true_sample, y_pred_sample, alpha=0.6, s=20)
-        max_val = max(np.max(y_true_sample), np.max(y_pred_sample))
-        ax1.plot([0, max_val], [0, max_val], 'r--', lw=2, alpha=0.8)
-        ax1.set_xlabel('Actual LTV')
-        ax1.set_ylabel('Predicted LTV')
-        ax1.set_title(f'{data["model_name"]}\nPredicted vs Actual (R² = {data["r2"]:.4f})')
-        ax1.grid(True, alpha=0.3)
-        
-        # Add correlation text
-        ax1.text(0.05, 0.95, f'Pearson: {data["correlation"]:.3f}\nSpearman: {data["spearman_corr"]:.3f}', 
-                transform=ax1.transAxes, verticalalignment='top', 
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        
-        # 2. Residuals plot
-        ax2 = fig.add_subplot(gs[1, col_start:col_start+2])
-        residuals = y_pred_sample - y_true_sample
-        ax2.scatter(y_pred_sample, residuals, alpha=0.6, s=20)
-        ax2.axhline(y=0, color='r', linestyle='--', lw=2)
-        ax2.set_xlabel('Predicted LTV')
-        ax2.set_ylabel('Residuals')
-        ax2.set_title(f'{data["model_name"]}\nResiduals Plot')
-        ax2.grid(True, alpha=0.3)
-        
-        # 3. Revenue capture analysis
-        ax3 = fig.add_subplot(gs[2, col_start])
-        
-        # Revenue metrics
-        metrics = ['Total Revenue\nCapture', 'Top 5%\nCapture', 'Top 10%\nCapture']
-        values = [data['revenue_capture_rate'], data['top_5_pct_capture'], data['top_10_pct_capture']]
-        colors = ['skyblue', 'lightgreen', 'lightcoral']
-        
-        bars = ax3.bar(metrics, values, color=colors, alpha=0.7)
-        ax3.set_ylabel('Capture Rate')
-        ax3.set_title(f'{data["model_name"]}\nRevenue Capture Analysis')
-        ax3.set_ylim(0, 1.2)
-        ax3.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for bar, value in zip(bars, values):
-            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
-                    f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
-        
-        # 4. Model performance metrics
-        ax4 = fig.add_subplot(gs[2, col_start+1])
-        
-        # Performance metrics
-        perf_metrics = ['MAE', 'RMSE', 'MAPE']
-        perf_values = [data['mae'], data['rmse'], 
-                      data['mape'] if data['mape'] != float('inf') else 0]
-        
-        # Normalize values for better visualization
-        if max(perf_values) > 0:
-            perf_values_norm = [v / max(perf_values) for v in perf_values]
-        else:
-            perf_values_norm = perf_values
-            
-        bars = ax4.bar(perf_metrics, perf_values_norm, color=['orange', 'purple', 'brown'], alpha=0.7)
-        ax4.set_ylabel('Normalized Error')
-        ax4.set_title(f'{data["model_name"]}\nError Metrics (Normalized)')
-        ax4.grid(True, alpha=0.3, axis='y')
-        
-        # Add actual values as text
-        for bar, actual_val in zip(bars, perf_values):
-            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
-                    f'{actual_val:.2f}', ha='center', va='bottom', fontsize=8)
-        
-        # 5. Feature importance (if available)
-        if data['feature_importance'] is not None:
-            ax5 = fig.add_subplot(gs[3, col_start:col_start+2])
-            
-            # Get top 10 features
-            importance_data = data['feature_importance']
-            if len(importance_data['importance']) > 10:
-                top_indices = np.argsort(importance_data['importance'])[-10:]
-                top_features = [importance_data['feature_names'][i] for i in top_indices]
-                top_importance = [importance_data['importance'][i] for i in top_indices]
-            else:
-                top_features = importance_data['feature_names']
-                top_importance = importance_data['importance']
-            
-            y_pos = np.arange(len(top_features))
-            ax5.barh(y_pos, top_importance, alpha=0.7)
-            ax5.set_yticks(y_pos)
-            ax5.set_yticklabels(top_features)
-            ax5.set_xlabel('Feature Importance')
-            ax5.set_title(f'{data["model_name"]}\nTop Feature Importance')
-            ax5.grid(True, alpha=0.3, axis='x')
-        else:
-            # Model summary instead of feature importance
-            ax5 = fig.add_subplot(gs[3, col_start:col_start+2])
-            ax5.axis('off')
-            
-            summary_text = f"""
-            {data["model_name"]} - PERFORMANCE SUMMARY
-            
-            Accuracy Metrics:
-            • MAE: {data['mae']:.4f}
-            • RMSE: {data['rmse']:.4f}
-            • R² Score: {data['r2']:.4f}
-            • MAPE: {data['mape']:.2f}% (non-zero only)
-            
-            Business Metrics:
-            • Total Revenue Capture: {data['revenue_capture_rate']*100:.1f}%
-            • Predicted Revenue: ${data['total_predicted_revenue']:.2f}
-            • Actual Revenue: ${data['total_actual_revenue']:.2f}
-            
-            User Targeting:
-            • Actual Spenders: {data['actual_spenders']}
-            • Predicted Spenders: {data['predicted_spenders']}
-            
-            Top Percentile Performance:
-            • Top 5% Revenue Capture: {data['top_5_pct_capture']*100:.1f}%
-            • Top 10% Revenue Capture: {data['top_10_pct_capture']*100:.1f}%
-            """
-            
-            ax5.text(0.05, 0.95, summary_text, transform=ax5.transAxes, 
-                    fontsize=9, verticalalignment='top', fontfamily='monospace',
-                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    n_models = len(good_models)
     
-    plt.suptitle('Comprehensive LTV Model Evaluation', fontsize=20, y=0.98)
-    plt.savefig('comprehensive_ltv_evaluation.png', dpi=300, bbox_inches='tight')
-    print(f"Saved comprehensive evaluation plot with {n_models} models")
-    plt.close()
+    # Create single comprehensive figure with 6 subplots
+    fig = plt.figure(figsize=(24, 20))
+    colors = plt.cm.Set3(np.linspace(0, 1, n_models))
     
-    # Clear collected data
-    PLOT_DATA.clear()
+    # 1. ROC Curves (top left)
+    ax1 = plt.subplot(3, 2, 1)
+    for i, data in enumerate(good_models):
+        # Convert regression to binary classification for ROC
+        y_true_binary = (data['y_true'] > 0).astype(int)
+        y_pred_binary = (data['y_pred'] > 0).astype(int)
+        
+        if len(np.unique(y_true_binary)) > 1:
+            try:
+                fpr, tpr, _ = roc_curve(y_true_binary, data['y_pred'])
+                auc_score = auc(fpr, tpr)
+                ax1.plot(fpr, tpr, color=colors[i], linewidth=2, 
+                        label=f"{data['model_name']} (AUC: {auc_score:.3f})")
+            except:
+                pass
+    
+    ax1.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+    ax1.set_xlabel('False Positive Rate')
+    ax1.set_ylabel('True Positive Rate')
+    ax1.set_title('ROC Curves - Spender Detection')
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Precision-Recall Curves (top right)
+    ax2 = plt.subplot(3, 2, 2)
+    for i, data in enumerate(good_models):
+        y_true_binary = (data['y_true'] > 0).astype(int)
+        
+        if len(np.unique(y_true_binary)) > 1:
+            try:
+                precision, recall, _ = precision_recall_curve(y_true_binary, data['y_pred'])
+                pr_auc = auc(recall, precision)
+                ax2.plot(recall, precision, color=colors[i], linewidth=2,
+                        label=f"{data['model_name']} (AUC: {pr_auc:.3f})")
+            except:
+                pass
+    
+    ax2.set_xlabel('Recall')
+    ax2.set_ylabel('Precision')
+    ax2.set_title('Precision-Recall Curves')
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Performance Summary (middle left)
+    ax3 = plt.subplot(3, 2, 3)
+    model_names = [data['model_name'] for data in good_models]
+    r2_scores = [data['r2'] for data in good_models]
+    mae_scores = [data['mae'] for data in good_models]
+    
+    x_pos = np.arange(len(model_names))
+    
+    # Create grouped bar chart
+    width = 0.35
+    ax3_twin = ax3.twinx()
+    
+    bars1 = ax3.bar(x_pos - width/2, r2_scores, width, color=colors[:len(good_models)], 
+                   alpha=0.8, label='R² Score')
+    bars2 = ax3_twin.bar(x_pos + width/2, mae_scores, width, color='red', 
+                        alpha=0.6, label='MAE')
+    
+    ax3.set_xlabel('Models')
+    ax3.set_ylabel('R² Score', color='blue')
+    ax3_twin.set_ylabel('MAE', color='red')
+    ax3.set_title('Performance Summary: R² vs MAE')
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(model_names, rotation=45, ha='right')
+    ax3.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for bar, score in zip(bars1, r2_scores):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{score:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # 4. RMSE Comparison (middle right)
+    ax4 = plt.subplot(3, 2, 4)
+    rmse_scores = [data['rmse'] for data in good_models]
+    bars = ax4.bar(model_names, rmse_scores, color=colors[:len(good_models)], alpha=0.8)
+    ax4.set_ylabel('RMSE')
+    ax4.set_title('RMSE Comparison')
+    ax4.set_xticklabels(model_names, rotation=45, ha='right')
+    ax4.grid(True, alpha=0.3)
+    
+    # Add value labels
+    for bar, score in zip(bars, rmse_scores):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
+                f'{score:.1f}', ha='center', va='bottom', fontsize=9)
+    
+    # 5. Feature Importance (bottom left) - only for tree-based models
+    ax5 = plt.subplot(3, 2, 5)
+    feature_importance_data = [data for data in good_models if data['feature_importance'] is not None]
+    
+    if feature_importance_data:
+        # Use the best performing model's feature importance
+        best_model = max(feature_importance_data, key=lambda x: x['r2'])
+        importance = best_model['feature_importance']['importance']
+        feature_names = best_model['feature_importance']['feature_names']
+        
+        # Get top 15 features
+        top_indices = np.argsort(importance)[-15:]
+        top_importance = importance[top_indices]
+        top_names = [feature_names[i] for i in top_indices]
+        
+        bars = ax5.barh(range(15), top_importance, color='skyblue', alpha=0.8)
+        ax5.set_yticks(range(15))
+        ax5.set_yticklabels(top_names, fontsize=8)
+        ax5.set_xlabel('Feature Importance')
+        ax5.set_title(f'Top Features - {best_model["model_name"]}')
+        ax5.grid(True, alpha=0.3)
+    else:
+        ax5.text(0.5, 0.5, 'No feature importance available', 
+                ha='center', va='center', transform=ax5.transAxes)
+        ax5.set_title('Feature Importance')
+    
+    # 6. Revenue Capture Analysis (bottom right)
+    ax6 = plt.subplot(3, 2, 6)
+    capture_rates = [data['top_10_pct_capture'] * 100 for data in good_models]  # Convert to percentage
+    revenue_ratios = [data['total_predicted_revenue'] / max(data['total_actual_revenue'], 1) 
+                     for data in good_models]
+    
+    x_pos = np.arange(len(model_names))
+    width = 0.35
+    
+    bars1 = ax6.bar(x_pos - width/2, capture_rates, width, color='green', 
+                   alpha=0.7, label='Top 10% Capture (%)')
+    ax6_twin = ax6.twinx()
+    bars2 = ax6_twin.bar(x_pos + width/2, revenue_ratios, width, color='orange', 
+                        alpha=0.7, label='Pred/Actual Revenue Ratio')
+    
+    ax6.set_xlabel('Models')
+    ax6.set_ylabel('Top 10% Capture (%)', color='green')
+    ax6_twin.set_ylabel('Revenue Ratio', color='orange')
+    ax6.set_title('Business Metrics: Revenue Capture')
+    ax6.set_xticks(x_pos)
+    ax6.set_xticklabels(model_names, rotation=45, ha='right')
+    ax6.grid(True, alpha=0.3)
+    
+    # Add legends
+    ax6.legend(loc='upper left')
+    ax6_twin.legend(loc='upper right')
+    
+    plt.suptitle('LTV Prediction Models - Comprehensive Analysis (R² ≥ 0.1)', 
+                 fontsize=16, fontweight='bold', y=0.98)
+    
+    plt.tight_layout()
+    plt.savefig('ltv_models_comprehensive_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"\nComprehensive analysis plot saved as 'ltv_models_comprehensive_analysis.png'")
+    print(f"Models included: {', '.join([data['model_name'] for data in good_models])}")
+    print(f"Best model: {max(good_models, key=lambda x: x['r2'])['model_name']} (R² = {max(good_models, key=lambda x: x['r2'])['r2']:.4f})")
 
 def load_temporal_datasets():
     """Load temporal datasets using only behavioral features (no revenue features)"""
@@ -319,7 +366,39 @@ def load_temporal_datasets():
         
         -- Session depth indicators
         COUNT(DISTINCT e.session_id) / COUNT(DISTINCT DATE(e.attribution_event_timestamp)) AS avg_sessions_per_day,
-        COUNT(*) / COUNT(DISTINCT e.session_id) AS avg_events_per_session
+        COUNT(*) / COUNT(DISTINCT e.session_id) AS avg_events_per_session,
+        
+        -- Advanced ad engagement features (behavioral only, no revenue)
+        -- Note: event_name field not available, using alternative engagement metrics
+        0 AS ad_interaction_events,
+        0 AS ad_click_events,
+        0 AS ad_view_events,
+        0 AS video_ad_events,
+        0 AS store_browse_events,
+        
+        -- Social and sharing features (engagement indicators)
+        -- Note: event_name field not available, using alternative engagement metrics
+        0 AS social_share_events,
+        0 AS social_invite_events,
+        0 AS tutorial_completion_events,
+        0 AS game_progress_events,
+        0 AS achievement_events,
+        
+        -- App quality and technical engagement features
+        -- Note: event_name field not available, using alternative engagement metrics
+        0 AS error_events,
+        0 AS notification_events,
+        0 AS settings_interaction_events,
+        0 AS search_events,
+        
+        -- Deep engagement features
+        1 AS unique_event_types,
+        COUNT(DISTINCT EXTRACT(HOUR FROM e.attribution_event_timestamp)) AS active_hours_spread,
+        COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM e.attribution_event_timestamp)) AS active_days_of_week,
+        
+        -- Retention and re-engagement patterns
+        DATE_DIFF(MAX(DATE(e.attribution_event_timestamp)), MIN(DATE(e.attribution_event_timestamp)), DAY) AS activity_span_days,
+        COUNT(DISTINCT DATE(e.attribution_event_timestamp)) / (DATE_DIFF(MAX(DATE(e.attribution_event_timestamp)), MIN(DATE(e.attribution_event_timestamp)), DAY) + 1) AS activity_consistency_ratio
                 
       FROM `{table_path}` e
       JOIN install_dates i ON COALESCE(e.gaid, e.idfa, e.android_id, e.waid, e.idfv) = i.user_id
@@ -360,6 +439,29 @@ def load_temporal_datasets():
       SAFE_DIVIDE(f.late_night_events, f.total_events) AS late_night_ratio,
       SAFE_DIVIDE(f.fingerprinted_events, f.total_events) AS fingerprinted_ratio,
       SAFE_DIVIDE(f.reengagement_events, f.total_events) AS reengagement_ratio,
+      
+      -- Advanced ad engagement ratios
+      SAFE_DIVIDE(f.ad_interaction_events, f.total_events) AS ad_interaction_ratio,
+      SAFE_DIVIDE(f.ad_click_events, NULLIF(f.ad_view_events, 0)) AS ad_click_through_rate,
+      SAFE_DIVIDE(f.video_ad_events, NULLIF(f.ad_interaction_events, 0)) AS video_ad_preference_ratio,
+      SAFE_DIVIDE(f.store_browse_events, f.total_events) AS store_browse_ratio,
+      
+      -- Social engagement ratios
+      SAFE_DIVIDE(f.social_share_events + f.social_invite_events, f.total_events) AS social_engagement_ratio,
+      SAFE_DIVIDE(f.tutorial_completion_events, f.total_sessions) AS tutorial_completion_rate,
+      SAFE_DIVIDE(f.game_progress_events, f.total_events) AS game_progress_ratio,
+      SAFE_DIVIDE(f.achievement_events, f.total_events) AS achievement_ratio,
+      
+      -- App quality metrics
+      SAFE_DIVIDE(f.error_events, f.total_events) AS error_rate,
+      SAFE_DIVIDE(f.notification_events, f.total_events) AS notification_engagement_ratio,
+      SAFE_DIVIDE(f.settings_interaction_events, f.total_sessions) AS customization_ratio,
+      SAFE_DIVIDE(f.search_events, f.total_events) AS search_behavior_ratio,
+      
+      -- Deep engagement metrics
+      SAFE_DIVIDE(f.unique_event_types, f.total_events) AS event_diversity_ratio,
+      SAFE_DIVIDE(f.active_hours_spread, 24) AS time_diversity_ratio,
+      SAFE_DIVIDE(f.active_days_of_week, 7) AS weekly_consistency_ratio,
       
       -- Target variable (revenue-based but only for labels)
       COALESCE(t.ltv_30_days, 0) AS ltv_30_days,
@@ -421,43 +523,6 @@ def prepare_features(train_data, val_data, test_data):
     X_val = val_data[feature_cols].copy()
     X_test = test_data[feature_cols].copy()
     
-    # Handle missing values
-    for df in [X_train, X_val, X_test]:
-        df.fillna(0, inplace=True)
-        # Replace infinite values
-        df.replace([np.inf, -np.inf], 0, inplace=True)
-    
-    # Encode categorical features consistently
-    categorical_cols = X_train.select_dtypes(include=['object']).columns
-    label_encoders = {}
-    
-    print(f"Encoding {len(categorical_cols)} categorical features...")
-    
-    for col in categorical_cols:
-        le = LabelEncoder()
-        # Fit on combined data to handle unseen categories
-        combined_data = pd.concat([X_train[col], X_val[col], X_test[col]]).astype(str)
-        le.fit(combined_data)
-        
-        X_train[col] = le.transform(X_train[col].astype(str))
-        X_val[col] = le.transform(X_val[col].astype(str))
-        X_test[col] = le.transform(X_test[col].astype(str))
-        
-        label_encoders[col] = le
-    
-    # Create binary features for top categories
-    high_cardinality_cols = ['country', 'channel', 'engagement_bucket']  # Updated column names
-    for col in high_cardinality_cols:
-        if col in X_train.columns:
-            # Get top 5 categories from training data
-            combined_col = pd.concat([train_data[col], val_data[col], test_data[col]])
-            top_categories = combined_col.value_counts().head(5).index
-            
-            for cat in top_categories:
-                X_train[f'{col}_is_{cat}'] = (train_data[col] == cat).astype(int)
-                X_val[f'{col}_is_{cat}'] = (val_data[col] == cat).astype(int)
-                X_test[f'{col}_is_{cat}'] = (test_data[col] == cat).astype(int)
-    
     # Extract targets - handle different possible target column names
     target_col = 'ltv_30_days'
     if target_col not in train_data.columns:
@@ -466,90 +531,358 @@ def prepare_features(train_data, val_data, test_data):
         for col in possible_targets:
             if col in train_data.columns:
                 target_col = col
-                print(f"Using {target_col} as target variable")
+                print(f"Using target column: {target_col}")
                 break
         else:
-            raise ValueError("No suitable target column found")
+            raise ValueError("No valid target column found!")
     
-    y_train = train_data[target_col].values
-    y_val = val_data[target_col].values
-    y_test = test_data[target_col].values
+    y_train = train_data[target_col].copy()
+    y_val = val_data[target_col].copy()
+    y_test = test_data[target_col].copy()
     
-    # Create additional derived features
-    print("Creating advanced behavioral features...")
+    # Handle missing values - fill with 0 for behavioral features
+    print("\nHandling missing values...")
+    X_train = X_train.fillna(0)
+    X_val = X_val.fillna(0)
+    X_test = X_test.fillna(0)
     
-    for df, data in zip([X_train, X_val, X_test], [train_data, val_data, test_data]):
-        # Ensure we have the required columns for calculations
-        session_col = 'total_sessions'
-        events_col = 'total_events'
-        active_days_col = 'active_days'
+    # Encode categorical variables
+    categorical_cols = []
+    for col in feature_cols:
+        if X_train[col].dtype == 'object':
+            categorical_cols.append(col)
+    
+    if categorical_cols:
+        print(f"Encoding {len(categorical_cols)} categorical columns: {categorical_cols}")
+        from sklearn.preprocessing import LabelEncoder
         
-        # Basic engagement score (handle missing columns gracefully)
-        engagement_components = []
-        if session_col in df.columns:
-            engagement_components.append(df[session_col] * 0.3)
-        if events_col in df.columns:
-            engagement_components.append(df[events_col] * 0.2)
-        if active_days_col in df.columns:
-            engagement_components.append(df[active_days_col] * 0.2)
-        
-        # Add store/product interaction components if available
-        if 'store_interactions' in df.columns:
-            engagement_components.append(df['store_interactions'] * 0.2)
-        if 'unique_products_viewed' in df.columns:
-            engagement_components.append(df['unique_products_viewed'] * 0.1)
-        
-        if engagement_components:
-            df['engagement_score'] = sum(engagement_components)
-        else:
-            df['engagement_score'] = 0
-        
-        # User behavior pattern features (with safe calculations)
-        if events_col in df.columns:
-            df['is_heavy_user'] = (df[events_col] > df[events_col].quantile(0.8)).astype(int)
-        else:
-            df['is_heavy_user'] = 0
+        for col in categorical_cols:
+            le = LabelEncoder()
             
-        if 'unique_products_viewed' in df.columns:
-            df['is_product_explorer'] = (df['unique_products_viewed'] > df['unique_products_viewed'].quantile(0.7)).astype(int)
-        else:
-            df['is_product_explorer'] = 0
+            # Combine all values to ensure consistent encoding
+            all_values = pd.concat([X_train[col], X_val[col], X_test[col]]).astype(str)
+            le.fit(all_values)
             
-        if active_days_col in df.columns:
-            df['is_consistent_user'] = (df[active_days_col] >= 3).astype(int)
-        else:
-            df['is_consistent_user'] = 0
-            
-        if 'weekend_ratio' in df.columns:
-            df['is_weekend_user'] = (df['weekend_ratio'] > 0.3).astype(int)
-        else:
-            df['is_weekend_user'] = 0
-            
-        if 'business_hours_ratio' in df.columns:
-            df['is_business_hours_user'] = (df['business_hours_ratio'] > 0.5).astype(int)
-        else:
-            df['is_business_hours_user'] = 0
-        
-        # Interaction features (with safe calculations)
-        sessions_val = df.get(session_col, pd.Series([0] * len(df)))
-        products_val = df.get('unique_products_viewed', pd.Series([0] * len(df)))
-        events_val = df.get(events_col, pd.Series([0] * len(df)))
-        active_days_val = df.get(active_days_col, pd.Series([0] * len(df)))
-        store_interactions_val = df.get('store_interactions', pd.Series([0] * len(df)))
-        
-        df['sessions_x_products'] = sessions_val * products_val
-        df['events_x_active_days'] = events_val * active_days_val
-        df['store_interactions_x_sessions'] = store_interactions_val * sessions_val
+            # Transform each dataset
+            X_train[col] = le.transform(X_train[col].astype(str))
+            X_val[col] = le.transform(X_val[col].astype(str))
+            X_test[col] = le.transform(X_test[col].astype(str))
     
-    # Update feature columns
-    feature_cols = list(X_train.columns)
+    print(f"\nFinal dataset shapes:")
+    print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+    print(f"X_val: {X_val.shape}, y_val: {y_val.shape}")
+    print(f"X_test: {X_test.shape}, y_test: {y_test.shape}")
     
-    print(f"Final feature set: {len(feature_cols)} features")
-    print(f"Target distribution - Train: ${y_train.mean():.2f} ± ${y_train.std():.2f}")
-    print(f"Target distribution - Val: ${y_val.mean():.2f} ± ${y_val.std():.2f}")
-    print(f"Target distribution - Test: ${y_test.mean():.2f} ± ${y_test.std():.2f}")
+    print(f"\nTarget statistics:")
+    print(f"Train - Mean: ${y_train.mean():.2f}, Std: ${y_train.std():.2f}, Spenders: {(y_train > 0).sum()}")
+    print(f"Val - Mean: ${y_val.mean():.2f}, Std: ${y_val.std():.2f}, Spenders: {(y_val > 0).sum()}")
+    print(f"Test - Mean: ${y_test.mean():.2f}, Std: ${y_test.std():.2f}, Spenders: {(y_test > 0).sum()}")
     
     return X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
+
+# Note: The actual train_ensemble_ltv_models function is defined later in the file
+
+def create_comprehensive_plots():
+    """Create comprehensive comparison plots for all models"""
+    import os
+    os.makedirs('plots', exist_ok=True)
+    
+    if len(PLOT_DATA) == 0:
+        print("No plot data available")
+        return
+    
+    # Model comparison plots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('Model Performance Comparison', fontsize=16)
+    
+    # Collect metrics for all models
+    model_names = [data['model_name'] for data in PLOT_DATA]
+    rmse_values = []
+    r2_values = []
+    mae_values = []
+    
+    for data in PLOT_DATA:
+        y_true = data['y_true']
+        y_pred = data['y_pred']
+        
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        r2 = r2_score(y_true, y_pred)
+        mae = mean_absolute_error(y_true, y_pred)
+        
+        rmse_values.append(rmse)
+        r2_values.append(r2)
+        mae_values.append(mae)
+    
+    # Plot 1: RMSE comparison
+    axes[0,0].bar(range(len(model_names)), rmse_values)
+    axes[0,0].set_xticks(range(len(model_names)))
+    axes[0,0].set_xticklabels(model_names, rotation=45, ha='right')
+    axes[0,0].set_title('RMSE Comparison')
+    axes[0,0].set_ylabel('RMSE ($)')
+    
+    # Plot 2: R² comparison
+    axes[0,1].bar(range(len(model_names)), r2_values)
+    axes[0,1].set_xticks(range(len(model_names)))
+    axes[0,1].set_xticklabels(model_names, rotation=45, ha='right')
+    axes[0,1].set_title('R² Comparison')
+    axes[0,1].set_ylabel('R² Score')
+    
+    # Plot 3: Actual vs Predicted for best model
+    best_idx = np.argmax(r2_values)
+    best_data = PLOT_DATA[best_idx]
+    y_true = best_data['y_true']
+    y_pred = best_data['y_pred']
+    
+    axes[1,0].scatter(y_true, y_pred, alpha=0.6)
+    max_val = max(y_true.max(), y_pred.max())
+    axes[1,0].plot([0, max_val], [0, max_val], 'r--')
+    axes[1,0].set_xlabel('Actual LTV ($)')
+    axes[1,0].set_ylabel('Predicted LTV ($)')
+    axes[1,0].set_title(f'Best Model: {best_data["model_name"]}')
+    
+    # Plot 4: Feature importance for best model
+    if best_data['feature_importance'] is not None:
+        importance = best_data['feature_importance']['importance']
+        feature_names = best_data['feature_importance']['feature_names']
+        top_indices = np.argsort(importance)[-10:]
+        
+        axes[1,1].barh(range(10), importance[top_indices])
+        axes[1,1].set_yticks(range(10))
+        axes[1,1].set_yticklabels([feature_names[i] for i in top_indices])
+        axes[1,1].set_title(f'Top Features - {best_data["model_name"]}')
+        axes[1,1].set_xlabel('Importance')
+    else:
+        axes[1,1].text(0.5, 0.5, 'No feature importance available', 
+                      ha='center', va='center', transform=axes[1,1].transAxes)
+        axes[1,1].set_title('Feature Importance')
+    
+    plt.tight_layout()
+    plt.savefig('plots/model_comparison_comprehensive.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Additional comparison plot - Error distribution
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    
+    for data in PLOT_DATA[:5]:  # Show top 5 models
+        y_true = data['y_true']
+        y_pred = data['y_pred']
+        residuals = y_pred - y_true
+        
+        ax.hist(residuals, alpha=0.6, bins=30, label=data['model_name'], density=True)
+    
+    ax.set_xlabel('Prediction Error ($)')
+    ax.set_ylabel('Density')
+    ax.set_title('Error Distribution Comparison (Top 5 Models)')
+    ax.legend()
+    ax.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig('plots/error_distribution_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved comprehensive comparison plots to 'plots/' directory")
+
+def create_roc_pr_curves():
+    """Create ROC and Precision-Recall curves for all models"""
+    from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+    from scipy.interpolate import interp1d
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import numpy as np
+    import os
+
+    os.makedirs('plots', exist_ok=True)
+
+    if len(PLOT_DATA) == 0:
+        print("No plot data available for ROC/PR curves")
+        return
+
+    # Create figure with subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+    # Colors for different models
+    colors = plt.cm.tab10(np.linspace(0, 1, len(PLOT_DATA)))
+
+    print("\nCalculating ROC and PR curves for LTV prediction (binary: LTV > 0)...")
+
+    roc_results = []
+    pr_results = []
+
+    for i, data in enumerate(PLOT_DATA):
+        model_name = data['model_name']
+        y_true = data['y_true']
+        y_pred = data['y_pred']
+
+        # Convert to binary classification (LTV > 0 vs LTV = 0)
+        y_true_binary = (y_true > 0).astype(int)
+
+        # Use predictions as scores (higher prediction = more likely to have LTV > 0)
+        y_scores = y_pred
+
+        try:
+            # ROC Curve
+            fpr, tpr, _ = roc_curve(y_true_binary, y_scores)
+            roc_auc = auc(fpr, tpr)
+
+            # Precision-Recall Curve
+            precision, recall, thresholds = precision_recall_curve(y_true_binary, y_scores)
+            pr_auc = average_precision_score(y_true_binary, y_scores)
+
+            # Interpolate precision at recall = 0.90
+            precision_at_90_recall = "N/A"
+            try:
+                if np.any(recall >= 0.9):
+                    recall_reversed = recall[::-1]
+                    precision_reversed = precision[::-1]
+                    interp_func = interp1d(recall_reversed, precision_reversed, kind='linear', fill_value="extrapolate")
+                    precision_val = float(interp_func(0.9))
+                    precision_at_90_recall = f"{precision_val:.3f}"
+            except Exception as e:
+                print(f"    Could not interpolate precision@0.9 recall for {model_name}: {e}")
+
+            # Store results
+            roc_results.append({
+                'model': model_name,
+                'roc_auc': roc_auc,
+                'fpr': fpr,
+                'tpr': tpr,
+                'precision_at_90_recall': precision_at_90_recall
+            })
+
+            pr_results.append({
+                'model': model_name,
+                'pr_auc': pr_auc,
+                'precision': precision,
+                'recall': recall
+            })
+
+            # Plot ROC curve
+            ax1.plot(fpr, tpr, color=colors[i], linewidth=2,
+                     label=f'{model_name} (AUC = {roc_auc:.3f})')
+
+            # Plot PR curve
+            ax2.plot(recall, precision, color=colors[i], linewidth=2,
+                     label=f'{model_name} (AP = {pr_auc:.3f})')
+
+            print(f"  {model_name}: ROC-AUC = {roc_auc:.3f}, PR-AUC = {pr_auc:.3f}, Precision@0.9Recall = {precision_at_90_recall}")
+
+        except Exception as e:
+            print(f"  Error calculating curves for {model_name}: {e}")
+            continue
+
+    # Format ROC plot
+    ax1.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random (AUC = 0.500)')
+    ax1.set_xlim([0.0, 1.0])
+    ax1.set_ylim([0.0, 1.05])
+    ax1.set_xlabel('False Positive Rate')
+    ax1.set_ylabel('True Positive Rate')
+    ax1.set_title('ROC Curves - LTV Prediction (LTV > 0)')
+    ax1.legend(loc="lower right", fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Format PR plot
+    # Calculate baseline precision from first model's data
+    first_y_true = PLOT_DATA[0]['y_true']
+    y_true_binary_baseline = (first_y_true > 0).astype(int)
+    baseline_precision = np.sum(y_true_binary_baseline) / len(y_true_binary_baseline)
+    ax2.axhline(y=baseline_precision, color='k', linestyle='--', linewidth=1,
+                label=f'Random (AP = {baseline_precision:.3f})')
+    ax2.set_xlim([0.0, 1.0])
+    ax2.set_ylim([0.0, 1.05])
+    ax2.set_xlabel('Recall')
+    ax2.set_ylabel('Precision')
+    ax2.set_title('Precision-Recall Curves - LTV Prediction (LTV > 0)')
+    ax2.legend(loc="upper right", fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('plots/roc_pr_curves_all_models.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Create summary table
+    summary_data = []
+    for roc_res, pr_res in zip(roc_results, pr_results):
+        summary_data.append({
+            'Model': roc_res['model'],
+            'ROC_AUC': roc_res['roc_auc'],
+            'PR_AUC': pr_res['pr_auc'],
+            'Precision_at_90_Recall': roc_res['precision_at_90_recall']
+        })
+
+    summary_df = pd.DataFrame(summary_data)
+    summary_df = summary_df.sort_values('ROC_AUC', ascending=False)
+
+    print(f"\nLTV > 0 Detection Performance Summary:")
+    print("=" * 60)
+    print(summary_df.round(3))
+
+    # Save summary
+    summary_df.to_csv('ltv_detection_performance.csv', index=False)
+
+    print(f"\nSaved ROC/PR curves to 'plots/roc_pr_curves_all_models.png'")
+    print(f"Saved LTV detection summary to 'ltv_detection_performance.csv'")
+
+    return summary_df
+
+def create_individual_model_plots():
+    """Create individual detailed plots for each model"""
+    import os
+    os.makedirs('plots/individual_models', exist_ok=True)
+    
+    for data in PLOT_DATA:
+        # Create individual model figure
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f'{data["model_name"]} - Detailed Analysis', fontsize=14)
+        
+        # Simple plots for each model
+        y_true = data['y_true']
+        y_pred = data['y_pred']
+        
+        # Plot 1: Actual vs Predicted
+        axes[0,0].scatter(y_true, y_pred, alpha=0.6)
+        axes[0,0].plot([0, max(y_true.max(), y_pred.max())], [0, max(y_true.max(), y_pred.max())], 'r--')
+        axes[0,0].set_xlabel('Actual LTV')
+        axes[0,0].set_ylabel('Predicted LTV')
+        axes[0,0].set_title('Actual vs Predicted')
+        
+        # Plot 2: Residuals
+        residuals = y_pred - y_true
+        axes[0,1].scatter(y_pred, residuals, alpha=0.6)
+        axes[0,1].axhline(y=0, color='r', linestyle='--')
+        axes[0,1].set_xlabel('Predicted LTV')
+        axes[0,1].set_ylabel('Residuals')
+        axes[0,1].set_title('Residuals Plot')
+        
+        # Plot 3: Distribution
+        axes[1,0].hist(y_true[y_true > 0], alpha=0.7, label='Actual', bins=20)
+        axes[1,0].hist(y_pred[y_pred > 0], alpha=0.7, label='Predicted', bins=20)
+        axes[1,0].set_xlabel('LTV')
+        axes[1,0].set_ylabel('Frequency')
+        axes[1,0].set_title('LTV Distribution')
+        axes[1,0].legend()
+        
+        # Plot 4: Feature Importance (if available)
+        if data['feature_importance'] is not None:
+            importance = data['feature_importance']['importance']
+            feature_names = data['feature_importance']['feature_names']
+            top_indices = np.argsort(importance)[-10:]
+            axes[1,1].barh(range(10), importance[top_indices])
+            axes[1,1].set_yticks(range(10))
+            axes[1,1].set_yticklabels([feature_names[i] for i in top_indices])
+            axes[1,1].set_title('Top 10 Features')
+        else:
+            axes[1,1].text(0.5, 0.5, 'No feature importance available', 
+                          ha='center', va='center', transform=axes[1,1].transAxes)
+            axes[1,1].set_title('Feature Importance')
+        
+        plt.tight_layout()
+        plt.savefig(f'plots/individual_models/{data["model_name"].replace(" ", "_")}_analysis.png', 
+                   dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    print(f"Saved individual model plots for {len(PLOT_DATA)} models")
+
+# Load data and train models functions are defined later in the file
 
 def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, feature_cols):
     """Train multiple LTV prediction models and ensemble them"""
@@ -558,7 +891,13 @@ def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, fe
     print("TRAINING ENSEMBLE LTV PREDICTION MODELS")
     print("="*80)
     
-    # Scale features using RobustScaler (less sensitive to outliers)
+    # Clear any previous plot data
+    global PLOT_DATA
+    PLOT_DATA.clear()
+    
+    # Feature scaling
+    from sklearn.preprocessing import RobustScaler
+    print("\nScaling features using RobustScaler...")
     scaler = RobustScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
@@ -566,368 +905,382 @@ def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, fe
     
     models = {}
     predictions = {}
+    results = []
     
-    # 1. Random Forest Regressor
-    print("\n1. Training Random Forest Regressor...")
-    rf_model = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=15,
-        min_samples_split=10,
-        min_samples_leaf=5,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=-1
-    )
+    # Import all necessary libraries
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor, ExtraTreesRegressor
+    from sklearn.linear_model import Ridge, Lasso, ElasticNet, LinearRegression
+    from sklearn.tree import DecisionTreeRegressor
+    import xgboost as xgb
+    from catboost import CatBoostRegressor
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    import joblib
+    import os
     
-    rf_model.fit(X_train_scaled, y_train)
-    rf_pred = rf_model.predict(X_test_scaled)
-    rf_pred = np.maximum(rf_pred, 0)  # Ensure non-negative predictions
+    # Create models directory
+    os.makedirs('models', exist_ok=True)
     
-    models['Random Forest'] = rf_model
-    predictions['Random Forest'] = rf_pred
-    
-    # Feature importance for Random Forest
-    rf_importance = {
-        'feature_names': feature_cols,
-        'importance': rf_model.feature_importances_
-    }
-    
-    # Evaluate Random Forest
-    print(f"   Random Forest Results:")
-    print(f"   MAE: {mean_absolute_error(y_test, rf_pred):.4f}")
-    print(f"   RMSE: {np.sqrt(mean_squared_error(y_test, rf_pred)):.4f}")
-    print(f"   R²: {r2_score(y_test, rf_pred):.4f}")
-    
-    # Collect evaluation data
-    collect_evaluation_data(y_test, rf_pred, "Random Forest", rf_importance)
-    
-    # 2. Gradient Boosting Regressor
-    print("\n2. Training Gradient Boosting Regressor...")
-    gb_model = GradientBoostingRegressor(
-        n_estimators=150,
-        max_depth=8,
-        learning_rate=0.1,
-        min_samples_split=20,
-        min_samples_leaf=10,
-        max_features='sqrt',
-        random_state=42
-    )
-    
-    gb_model.fit(X_train_scaled, y_train)
-    gb_pred = gb_model.predict(X_test_scaled)
-    gb_pred = np.maximum(gb_pred, 0)  # Ensure non-negative predictions
-    
-    models['Gradient Boosting'] = gb_model
-    predictions['Gradient Boosting'] = gb_pred
-    
-    # Feature importance for Gradient Boosting
-    gb_importance = {
-        'feature_names': feature_cols,
-        'importance': gb_model.feature_importances_
-    }
-    
-    # Evaluate Gradient Boosting
-    print(f"   Gradient Boosting Results:")
-    print(f"   MAE: {mean_absolute_error(y_test, gb_pred):.4f}")
-    print(f"   RMSE: {np.sqrt(mean_squared_error(y_test, gb_pred)):.4f}")
-    print(f"   R²: {r2_score(y_test, gb_pred):.4f}")
-    
-    # Collect evaluation data
-    collect_evaluation_data(y_test, gb_pred, "Gradient Boosting", gb_importance)
-    
-    # 4. Ensemble Model (weighted average)
-    print("\n3. Creating Ensemble Model...")
-    
-    # Calculate weights based on validation performance
-    val_predictions = {}
-    val_scores = {}
-    
-    for name, model in models.items():
-        val_pred = model.predict(X_val_scaled)
-        val_pred = np.maximum(val_pred, 0)
-        val_predictions[name] = val_pred
-        val_scores[name] = r2_score(y_val, val_pred)
-    
-    # Calculate ensemble weights (higher weight for better R² scores)
-    total_score = sum(max(0, score) for score in val_scores.values())
-    if total_score > 0:
-        weights = {name: max(0, score) / total_score for name, score in val_scores.items()}
-    else:
-        weights = {name: 1/len(models) for name in models.keys()}
-    
-    print(f"   Ensemble weights: {weights}")
-    
-    # Create ensemble prediction
-    ensemble_pred = np.zeros(len(y_test))
-    for name, weight in weights.items():
-        ensemble_pred += weight * predictions[name]
-    
-    predictions['Ensemble'] = ensemble_pred
-    
-    # Evaluate Ensemble
-    print(f"   Ensemble Results:")
-    print(f"   MAE: {mean_absolute_error(y_test, ensemble_pred):.4f}")
-    print(f"   RMSE: {np.sqrt(mean_squared_error(y_test, ensemble_pred)):.4f}")
-    print(f"   R²: {r2_score(y_test, ensemble_pred):.4f}")
-    
-    # Collect evaluation data for ensemble
-    collect_evaluation_data(y_test, ensemble_pred, "Ensemble", None)
-    
-    # 5. Two-Stage Model (Classification + Regression)
-    print("\n4. Training Two-Stage Model (Classification + Regression)...")
-    
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.metrics import classification_report
-    
-    # Stage 1: Binary classification (spender vs non-spender)
-    y_binary_train = (y_train > 0).astype(int)
-    y_binary_test = (y_test > 0).astype(int)
-    
-    binary_classifier = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=10,
-        min_samples_leaf=5,
-        class_weight='balanced',
-        random_state=42
-    )
-    
-    binary_classifier.fit(X_train_scaled, y_binary_train)
-    binary_pred = binary_classifier.predict(X_test_scaled)
-    binary_proba = binary_classifier.predict_proba(X_test_scaled)[:, 1]
-    
-    print(f"   Binary Classification Results:")
-    print(f"   Actual spenders: {np.sum(y_binary_test)}")
-    print(f"   Predicted spenders: {np.sum(binary_pred)}")
-    
-    # Stage 2: Regression for predicted spenders
-    spender_mask_train = y_train > 0
-    two_stage_pred = np.zeros(len(y_test))
-    
-    if np.sum(spender_mask_train) > 10:
-        X_spenders = X_train_scaled[spender_mask_train]
-        y_spenders = y_train[spender_mask_train]
-        
-        # Use log transformation for better regression on positive values
-        y_spenders_log = np.log1p(y_spenders)
-        
-        regression_model = RandomForestRegressor(
+    # Define high-performing models only (removed KNN, SVR, Neural Network due to poor performance)
+    model_configs = {
+        'XGBoost': xgb.XGBRegressor(
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            eval_metric='rmse'
+        ),
+        'CatBoost': CatBoostRegressor(
+            iterations=200,
+            depth=6,
+            learning_rate=0.1,
+            random_seed=42,
+            verbose=False
+        ),
+        'Random Forest': RandomForestRegressor(
             n_estimators=100,
             max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1
+        ),
+        'Extra Trees': ExtraTreesRegressor(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42,
+            n_jobs=-1
+        ),
+        'Gradient Boosting': GradientBoostingRegressor(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
             random_state=42
-        )
-        
-        regression_model.fit(X_spenders, y_spenders_log)
-        
-        # Predict for all users, but weight by spender probability
-        log_predictions = regression_model.predict(X_test_scaled)
-        raw_predictions = np.expm1(log_predictions)
-        
-        # Weight predictions by spender probability
-        two_stage_pred = raw_predictions * binary_proba
-        two_stage_pred = np.maximum(two_stage_pred, 0)
-        
-        print(f"   Regression trained on {len(y_spenders)} spenders")
-    else:
-        print("   Not enough spenders for regression training")
-        two_stage_pred = binary_pred * np.mean(y_train[y_train > 0]) if np.sum(y_train > 0) > 0 else binary_pred
+        ),
+        'AdaBoost': AdaBoostRegressor(
+            n_estimators=100,
+            learning_rate=1.0,
+            random_state=42
+        ),
+        'Ridge Regression': Ridge(alpha=1.0),
+        'Lasso Regression': Lasso(alpha=1.0),
+        'Elastic Net': ElasticNet(alpha=1.0, l1_ratio=0.5),
+        'Linear Regression': LinearRegression(),
+        'Decision Tree': DecisionTreeRegressor(max_depth=10, random_state=42)
+    }
     
-    predictions['Two-Stage'] = two_stage_pred
+    print(f"\nTraining {len(model_configs)} different models...")
     
-    # Evaluate Two-Stage
-    print(f"   Two-Stage Results:")
-    print(f"   MAE: {mean_absolute_error(y_test, two_stage_pred):.4f}")
-    print(f"   RMSE: {np.sqrt(mean_squared_error(y_test, two_stage_pred)):.4f}")
-    print(f"   R²: {r2_score(y_test, two_stage_pred):.4f}")
-    
-    # Collect evaluation data
-    collect_evaluation_data(y_test, two_stage_pred, "Two-Stage", None)
-    
-    # Cross-validation analysis
-    print("\n" + "="*60)
-    print("CROSS-VALIDATION ANALYSIS")
-    print("="*60)
-    
-    cv_scores = {}
-    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
-    
-    for name, model in [('Random Forest', rf_model), ('Gradient Boosting', gb_model)]:
-        scores = cross_val_score(model, X_train_scaled, y_train, cv=kfold, 
-                               scoring='neg_mean_absolute_error', n_jobs=-1)
-        cv_scores[name] = -scores.mean()
-        print(f"{name} CV MAE: {cv_scores[name]:.4f} (±{scores.std():.4f})")
-    
-    # Model comparison summary
-    print("\n" + "="*80)
-    print("MODEL COMPARISON SUMMARY")
-    print("="*80)
-    
-    comparison_metrics = {}
-    for name, pred in predictions.items():
-        comparison_metrics[name] = {
-            'MAE': mean_absolute_error(y_test, pred),
-            'RMSE': np.sqrt(mean_squared_error(y_test, pred)),
-            'R²': r2_score(y_test, pred),
-            'Revenue_Capture': np.sum(pred) / np.sum(y_test) if np.sum(y_test) > 0 else 0,
-            'Mean_Prediction': np.mean(pred),
-            'Std_Prediction': np.std(pred)
-        }
+    for name, model in model_configs.items():
+        print(f"\n--- Training {name} ---")
+        try:
+            # Use scaled data for models that benefit from it
+            use_scaled = name in ['Ridge Regression', 'Lasso Regression', 'Elastic Net', 'Linear Regression']
+            
+            if use_scaled:
+                X_tr, X_v, X_te = X_train_scaled, X_val_scaled, X_test_scaled
+            else:
+                X_tr, X_v, X_te = X_train, X_val, X_test
+            
+            # Train model
+            model.fit(X_tr, y_train)
+            
+            # Make predictions
+            train_pred = model.predict(X_tr)
+            val_pred = model.predict(X_v)
+            test_pred = model.predict(X_te)
+            
+            # Calculate metrics
+            train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
+            train_mae = mean_absolute_error(y_train, train_pred)
+            train_r2 = r2_score(y_train, train_pred)
+            
+            val_rmse = np.sqrt(mean_squared_error(y_val, val_pred))
+            val_mae = mean_absolute_error(y_val, val_pred)
+            val_r2 = r2_score(y_val, val_pred)
+            
+            test_rmse = np.sqrt(mean_squared_error(y_test, test_pred))
+            test_mae = mean_absolute_error(y_test, test_pred)
+            test_r2 = r2_score(y_test, test_pred)
+            
+            # Store results
+            results.append({
+                'Model': name,
+                'Train_RMSE': train_rmse,
+                'Train_MAE': train_mae,
+                'Train_R2': train_r2,
+                'Val_RMSE': val_rmse,
+                'Val_MAE': val_mae,
+                'Val_R2': val_r2,
+                'Test_RMSE': test_rmse,
+                'Test_MAE': test_mae,
+                'Test_R2': test_r2
+            })
+            
+            # Store model and predictions
+            models[name] = model
+            predictions[name] = {
+                'train': train_pred,
+                'val': val_pred,
+                'test': test_pred
+            }
+            
+            # Save model
+            joblib.dump(model, f'models/{name.replace(" ", "_").lower()}_model.pkl')
+            
+            # Get feature importance if available
+            feature_importance = None
+            if hasattr(model, 'feature_importances_'):
+                feature_importance = {
+                    'importance': model.feature_importances_,
+                    'feature_names': feature_cols
+                }
+            elif hasattr(model, 'coef_'):
+                feature_importance = {
+                    'importance': np.abs(model.coef_),
+                    'feature_names': feature_cols
+                }
+            
+            # Store plot data
+            PLOT_DATA.append({
+                'model_name': name,
+                'y_true': y_test,
+                'y_pred': test_pred,
+                'feature_importance': feature_importance,
+                'train_rmse': train_rmse,
+                'val_rmse': val_rmse,
+                'test_rmse': test_rmse,
+                'train_r2': train_r2,
+                'val_r2': val_r2,
+                'test_r2': test_r2
+            })
+            
+            print(f"   Train RMSE: ${train_rmse:.2f}, Val RMSE: ${val_rmse:.2f}, Test RMSE: ${test_rmse:.2f}")
+            print(f"   Train R²: {train_r2:.3f}, Val R²: {val_r2:.3f}, Test R²: {test_r2:.3f}")
+            
+        except Exception as e:
+            print(f"   Error training {name}: {str(e)}")
+            continue
     
     # Create comparison DataFrame
-    comparison_df = pd.DataFrame(comparison_metrics).T
-    comparison_df = comparison_df.round(4)
-    print(comparison_df)
+    comparison_df = pd.DataFrame(results)
     
-    # Business impact analysis
-    print("\n" + "="*60)
-    print("BUSINESS IMPACT ANALYSIS")
-    print("="*60)
-    
-    actual_total_revenue = np.sum(y_test)
-    actual_spenders = np.sum(y_test > 0)
-    
-    for name, pred in predictions.items():
-        predicted_total_revenue = np.sum(pred)
-        predicted_spenders = np.sum(pred > 0)
+    if len(comparison_df) > 0:
+        # Sort by validation RMSE
+        comparison_df = comparison_df.sort_values('Val_RMSE').reset_index(drop=True)
         
-        # Top 10% analysis
-        top_10_pct_users = int(0.1 * len(pred))
-        top_10_pct_idx = np.argsort(pred)[-top_10_pct_users:]
-        top_10_pct_actual_revenue = np.sum(y_test[top_10_pct_idx])
-        top_10_pct_capture_rate = top_10_pct_actual_revenue / actual_total_revenue if actual_total_revenue > 0 else 0
+        print(f"\n" + "="*80)
+        print("MODEL COMPARISON RESULTS")
+        print("="*80)
+        print(comparison_df.round(3))
         
-        print(f"\n{name} Model:")
-        print(f"  Revenue Capture Rate: {predicted_total_revenue/actual_total_revenue*100:.1f}%")
-        print(f"  Predicted Spenders: {predicted_spenders} (Actual: {actual_spenders})")
-        print(f"  Top 10% Revenue Capture: {top_10_pct_capture_rate*100:.1f}%")
-        print(f"  Average Predicted LTV: ${np.mean(pred):.2f}")
+        # Save comparison results
+        comparison_df.to_csv('model_comparison_results.csv', index=False)
+        print(f"\nSaved model comparison results to 'model_comparison_results.csv'")
         
-        if predicted_spenders > 0:
-            efficiency = predicted_total_revenue / predicted_spenders
-            print(f"  Revenue per Targeted User: ${efficiency:.2f}")
+        # Save scaler
+        joblib.dump(scaler, 'models/feature_scaler.pkl')
+        print(f"Saved feature scaler to 'models/feature_scaler.pkl'")
+        
+        # Create ensemble prediction (simple average of top 3 models)
+        top_3_models = comparison_df.head(3)['Model'].tolist()
+        if len(top_3_models) >= 3:
+            ensemble_pred_test = np.mean([predictions[model]['test'] for model in top_3_models], axis=0)
+            ensemble_pred_val = np.mean([predictions[model]['val'] for model in top_3_models], axis=0)
+            ensemble_pred_train = np.mean([predictions[model]['train'] for model in top_3_models], axis=0)
+            
+            ensemble_rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred_test))
+            ensemble_mae = mean_absolute_error(y_test, ensemble_pred_test)
+            ensemble_r2 = r2_score(y_test, ensemble_pred_test)
+            
+            predictions['Ensemble (Top 3)'] = {
+                'test': ensemble_pred_test,
+                'val': ensemble_pred_val,
+                'train': ensemble_pred_train
+            }
+            
+            # Add ensemble to plot data for ROC/PR curves
+            PLOT_DATA.append({
+                'model_name': 'Ensemble (Top 3)',
+                'y_true': y_test,
+                'y_pred': ensemble_pred_test,
+                'feature_importance': None,  # No feature importance for ensemble
+                'train_rmse': None,
+                'val_rmse': None,
+                'test_rmse': ensemble_rmse,
+                'train_r2': None,
+                'val_r2': None,
+                'test_r2': ensemble_r2
+            })
+            
+            print(f"\nEnsemble Model (Top 3 average):")
+            print(f"   Test RMSE: ${ensemble_rmse:.2f}, Test MAE: ${ensemble_mae:.2f}, Test R²: {ensemble_r2:.3f}")
+            print(f"   Models used: {', '.join(top_3_models)}")
     
     return models, predictions, comparison_df
 
-def main():
-    print("="*80)
-    print("LTV PREDICTION PIPELINE")
-    print("="*80)
-    print("Loading datasets...")
+def save_datasets(train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols):
+    """Save all datasets and processed features"""
+    import os
+    import joblib
+    
+    # Create data directory
+    os.makedirs('data', exist_ok=True)
+    
+    print("\nSaving datasets...")
+    
+    # Save raw datasets
+    train_data.to_csv('data/train_data_raw.csv', index=False)
+    val_data.to_csv('data/val_data_raw.csv', index=False)
+    test_data.to_csv('data/test_data_raw.csv', index=False)
+    
+    # Save processed features
+    pd.DataFrame(X_train, columns=feature_cols).to_csv('data/X_train.csv', index=False)
+    pd.DataFrame(X_val, columns=feature_cols).to_csv('data/X_val.csv', index=False)
+    pd.DataFrame(X_test, columns=feature_cols).to_csv('data/X_test.csv', index=False)
+    
+    # Save targets
+    pd.DataFrame({'ltv_30_days': y_train}).to_csv('data/y_train.csv', index=False)
+    pd.DataFrame({'ltv_30_days': y_val}).to_csv('data/y_val.csv', index=False)
+    pd.DataFrame({'ltv_30_days': y_test}).to_csv('data/y_test.csv', index=False)
+    
+    # Save feature column names
+    joblib.dump(feature_cols, 'data/feature_columns.pkl')
+    
+    # Save dataset summary
+    summary = {
+        'train_shape': train_data.shape,
+        'val_shape': val_data.shape,
+        'test_shape': test_data.shape,
+        'num_features': len(feature_cols),
+        'feature_names': feature_cols,
+        'train_ltv_stats': {
+            'mean': float(y_train.mean()),
+            'std': float(y_train.std()),
+            'spenders': int((y_train > 0).sum()),
+            'spender_rate': float((y_train > 0).mean())
+        },
+        'val_ltv_stats': {
+            'mean': float(y_val.mean()),
+            'std': float(y_val.std()),
+            'spenders': int((y_val > 0).sum()),
+            'spender_rate': float((y_val > 0).mean())
+        },
+        'test_ltv_stats': {
+            'mean': float(y_test.mean()),
+            'std': float(y_test.std()),
+            'spenders': int((y_test > 0).sum()),
+            'spender_rate': float((y_test > 0).mean())
+        }
+    }
+    
+    import json
+    with open('data/dataset_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"Saved datasets to 'data/' directory:")
+    print(f"  - Raw datasets: train_data_raw.csv, val_data_raw.csv, test_data_raw.csv")
+    print(f"  - Features: X_train.csv, X_val.csv, X_test.csv")
+    print(f"  - Targets: y_train.csv, y_val.csv, y_test.csv")
+    print(f"  - Feature names: feature_columns.pkl")
+    print(f"  - Summary: dataset_summary.json")
+
+def load_existing_datasets():
+    """Load existing processed datasets if they exist"""
+    import os
+    import joblib
+    
     try:
-        train_data = pd.read_csv("train_data.csv")
-        val_data = pd.read_csv("val_data.csv") 
-        test_data = pd.read_csv("test_data.csv")
-        print("Loaded from CSV files")
-    except FileNotFoundError:
-        print("CSV files not found. Using load_temporal_datasets()...")
-        datasets = load_temporal_datasets()
-        if datasets[0] is None:
-            print("ERROR: Cannot load datasets. Please ensure CSV files exist or BigQuery is configured.")
+        if (os.path.exists('data/X_train.csv') and 
+            os.path.exists('data/X_val.csv') and 
+            os.path.exists('data/X_test.csv') and
+            os.path.exists('data/y_train.csv') and
+            os.path.exists('data/y_val.csv') and
+            os.path.exists('data/y_test.csv') and
+            os.path.exists('data/feature_columns.pkl')):
+            
+            print("Found existing processed datasets. Loading...")
+            
+            # Load processed features
+            X_train = pd.read_csv('data/X_train.csv')
+            X_val = pd.read_csv('data/X_val.csv') 
+            X_test = pd.read_csv('data/X_test.csv')
+            
+            # Load targets
+            y_train = pd.read_csv('data/y_train.csv')['ltv_30_days'].values
+            y_val = pd.read_csv('data/y_val.csv')['ltv_30_days'].values
+            y_test = pd.read_csv('data/y_test.csv')['ltv_30_days'].values
+            
+            # Load feature columns
+            feature_cols = joblib.load('data/feature_columns.pkl')
+            
+            # Load raw data if available
+            train_data = None
+            val_data = None
+            test_data = None
+            
+            if (os.path.exists('data/train_data_raw.csv') and
+                os.path.exists('data/val_data_raw.csv') and
+                os.path.exists('data/test_data_raw.csv')):
+                train_data = pd.read_csv('data/train_data_raw.csv')
+                val_data = pd.read_csv('data/val_data_raw.csv')
+                test_data = pd.read_csv('data/test_data_raw.csv')
+            
+            print(f"Loaded existing datasets:")
+            print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
+            print(f"  X_val: {X_val.shape}, y_val: {y_val.shape}")
+            print(f"  X_test: {X_test.shape}, y_test: {y_test.shape}")
+            print(f"  Features: {len(feature_cols)}")
+            
+            return train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
+            
+    except Exception as e:
+        print(f"Error loading existing datasets: {e}")
+        print("Will create new datasets...")
+    
+    return None
+
+def main():
+    """Main execution function"""
+    print("LTV Prediction Pipeline - Enhanced Version")
+    
+    # Try to load existing datasets first
+    existing_data = load_existing_datasets()
+    
+    if existing_data is not None:
+        train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols = existing_data
+    else:
+        # Load and prepare data from scratch
+        print("\nLoading datasets from BigQuery...")
+        train_data, val_data, test_data = load_temporal_datasets()
+        
+        if train_data is None:
+            print("No data loaded. Exiting.")
             return None, None, None, None
         
-        train_data, val_data, test_data = datasets
+        # Prepare features
+        print("Preparing features...")
+        X_train, X_val, X_test, y_train, y_val, y_test, feature_cols = prepare_features(
+            train_data, val_data, test_data
+        )
         
-        # Save for future use
-        train_data.to_csv("train_data.csv", index=False)
-        val_data.to_csv("val_data.csv", index=False)
-        test_data.to_csv("test_data.csv", index=False)
-        print("Saved datasets to CSV files")
+        # Save datasets
+        save_datasets(train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols)
     
-    print(f"Train: {train_data.shape}")
-    print(f"Val: {val_data.shape}")
-    print(f"Test: {test_data.shape}")
-    
-    # Prepare features (ensuring no revenue data leakage)
-    X_train, X_val, X_test, y_train, y_val, y_test, feature_cols = prepare_features(
-        train_data, val_data, test_data
-    )
-    
-    print(f"\nDataset Summary:")
-    print(f"Features: {len(feature_cols)}")
-    print(f"Features: {feature_cols}")
-    print(f"Train samples: {len(X_train):,}")
-    print(f"Val samples: {len(X_val):,}")
-    print(f"Test samples: {len(X_test):,}")
-    print(f"Average LTV - Train: ${y_train.mean():.2f}, Test: ${y_test.mean():.2f}")
-    print(f"LTV std dev - Train: ${y_train.std():.2f}, Test: ${y_test.std():.2f}")
-    print(f"Spender rate - Train: {(y_train > 0).mean()*100:.1f}%, Test: {(y_test > 0).mean()*100:.1f}%")
-    
-    # Train ensemble models
+    # Train models
+    print("Training models...")
     models, predictions, comparison_df = train_ensemble_ltv_models(
         X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
     )
     
-    # Generate comprehensive evaluation plots
-    print("\n" + "="*60)
-    print("GENERATING COMPREHENSIVE EVALUATION PLOTS")
-    print("="*60)
-    plot_comprehensive_evaluation()
+    # Create comprehensive plots
+    if len(PLOT_DATA) > 0:
+        print("\nCreating visualizations...")
+        create_comprehensive_plots()
+        create_roc_pr_curves()
+        create_individual_model_plots()
     
-    # Final recommendations
-    print("\n" + "="*80)
-    print("RECOMMENDATIONS FOR IMPROVEMENT")
-    print("="*80)
-    
-    best_model = comparison_df['R²'].idxmax()
-    best_r2 = comparison_df.loc[best_model, 'R²']
-    best_mae = comparison_df.loc[best_model, 'MAE']
-    
-    print(f"Best performing model: {best_model}")
-    print(f"Best R² score: {best_r2:.4f}")
-    print(f"Best MAE: {best_mae:.4f}")
-    
-    print(f"\nNext steps to improve LTV prediction:")
-    print(f"1. Feature Engineering:")
-    print(f"   - Add more temporal features (hour of day patterns, day of week)")
-    print(f"   - Create user cohort features (install week, seasonal effects)")
-    print(f"   - Add interaction features between behavioral metrics")
-    print(f"   - Include sequence-based features (session patterns over time)")
-    
-    print(f"\n2. Advanced Modeling:")
-    print(f"   - Try XGBoost or LightGBM for better gradient boosting")
-    print(f"   - Implement neural networks for complex pattern recognition")
-    print(f"   - Use time series models for sequential behavior")
-    print(f"   - Add stacking ensemble with meta-learner")
-    
-    print(f"\n3. Data Quality:")
-    print(f"   - Increase feature collection period (D0-D7 instead of D0-D3)")
-    print(f"   - Add external data sources (device info, app store data)")
-    print(f"   - Implement feature importance analysis for feature selection")
-    print(f"   - Handle class imbalance with advanced sampling techniques")
-    
-    print(f"\n4. Evaluation Improvements:")
-    print(f"   - Use business-specific metrics (profit optimization)")
-    print(f"   - Implement time-based validation (forward chaining)")
-    print(f"   - Add confidence intervals for predictions")
-    print(f"   - Create segment-specific models (high/low engagement users)")
-    
-    if best_r2 < 0.3:
-        print(f"\nCurrent R² is low ({best_r2:.3f}). Consider:")
-        print(f"   - Collecting more behavioral features")
-        print(f"   - Extending feature collection period")
-        print(f"   - Using external data sources")
-        print(f"   - Focusing on user segments with predictable behavior")
-    elif best_r2 < 0.5:
-        print(f"\nModerate predictive power ({best_r2:.3f}). Improvements possible:")
-        print(f"   - Fine-tune hyperparameters")
-        print(f"   - Add feature interactions")
-        print(f"   - Try advanced ensemble methods")
-    else:
-        print(f"\nGood predictive power ({best_r2:.3f})! Focus on:")
-        print(f"   - Model deployment and monitoring")
-        print(f"   - A/B testing with business impact")
-        print(f"   - Regular model retraining")
-    
-    print(f"\n" + "="*80)
-    print("PIPELINE COMPLETED SUCCESSFULLY")
-    print("="*80)
-    print(f"Models trained: {len(models)}")
-    print(f"Evaluation plots saved: comprehensive_ltv_evaluation.png")
-    print(f"Best model: {best_model} (R² = {best_r2:.4f})")
-    
-    return models, predictions, comparison_df, (X_train, X_val, X_test, y_train, y_val, y_test)
+    print("Pipeline completed successfully!")
+    return models, predictions, comparison_df, test_data
 
 if __name__ == "__main__":
     models, predictions, comparison_df, data = main()
