@@ -1,3 +1,4 @@
+from matplotlib import table
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler, RobustScaler
@@ -299,203 +300,1306 @@ def load_temporal_datasets():
     DATASET = "test_data"        # Replace with your dataset
     TABLE = "app_data"           # Replace with your table
     FEATURE_DAYS = 3               # D0-D3 (4 days)
-    PREDICTION_DAYS = 30           # D4-D33 (30 days)
+    PREDICTION_DAYS = 60           # D4-D33 (30 days)
     
     client = bigquery.Client(project=PROJECT_ID)
     table_path = f"{PROJECT_ID}.{DATASET}.{TABLE}"
     
-    # Base query for behavioral features (NO REVENUE FIELDS)
-    base_query = f"""
-    WITH install_dates AS (
-      SELECT
-        COALESCE(gaid, idfa, android_id, waid, idfv) AS user_id,
-        DATE(MIN(attribution_event_timestamp)) AS install_date,
-        MIN(attribution_event_timestamp) AS install_timestamp
-      FROM `{table_path}`
-      WHERE DATE(attribution_event_timestamp) >= '{{start_date}}'
-        AND DATE(attribution_event_timestamp) <= '{{end_date}}'
-        AND (gaid IS NOT NULL OR idfa IS NOT NULL OR android_id IS NOT NULL)
-      GROUP BY user_id
-      HAVING COUNT(*) >= 5
-    ),
-    
-    behavioral_features AS (
-      SELECT
-        COALESCE(e.gaid, e.idfa, e.android_id, e.waid, e.idfv) AS user_id,
-        i.install_date,
-        i.install_timestamp,
+    train_query = f"""  
+        WITH install_cohort AS (
+        -- Get install date for Feb-March installs
+        SELECT 
+            COALESCE(gaid, idfa, android_id, custom_user_id) as user_id,
+            DATE(MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64))))) as install_date,
+            MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) as install_timestamp
+        FROM {table_path}
+        WHERE DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) >= '2024-08-01'
+            AND DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) <= '2025-01-01'
+            AND COALESCE(gaid, idfa, android_id, custom_user_id) IS NOT NULL
+            AND COALESCE(gaid, idfa, android_id, custom_user_id) != ''  -- Remove empty user IDs
+        GROUP BY COALESCE(gaid, idfa, android_id, custom_user_id)
+        ),
+
+        user_demographics AS (
+        -- Basic demographics and attribution info
+        SELECT 
+            ic.user_id,
+            ic.install_date,
+            ic.install_timestamp,
+            
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.country END) as country,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.city END) as city,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.state END) as state,
+            
+            -- Derive platform
+            ANY_VALUE(CASE 
+            WHEN e.idfa IS NOT NULL OR e.idfa_md5 IS NOT NULL OR e.idfv IS NOT NULL THEN 'ios'
+            WHEN e.gaid IS NOT NULL OR e.android_id IS NOT NULL THEN 'android'
+            ELSE 'unknown'
+            END) as platform,
+            
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.os_version END) as os_version,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.app_version END) as app_version,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.install_source END) as install_source,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.campaign_name END) as campaign_name,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.partner END) as partner,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.publisher_name END) as publisher_name
+            
+        FROM install_cohort ic
+        LEFT JOIN `{table_path}` e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date
+        GROUP BY ic.user_id, ic.install_date, ic.install_timestamp
+        ),
+
+        -- D0-D3 FEATURE WINDOW for training
+        feature_window_events AS (
+        SELECT 
+            ic.user_id,
+            COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64))) as event_timestamp,
+            e.session_id,
+            e.name,
+            e.arguments,
+            e.product_name,
+            e.product_sku,
+            e.product_category,
+            e.product_price,
+            e.product_quantity,
+            COALESCE(e.is_fingerprinted, false) as is_fingerprinted,
+            COALESCE(e.is_reengagement, false) as is_reengagement,
+            COALESCE(e.is_view_through, false) as is_view_through,
+            DATE_DIFF(DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))), ic.install_date, DAY) as day_offset
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) BETWEEN ic.install_date AND DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS} DAY)
+        WHERE e.name IS NOT NULL
+        ),
+
+        -- TARGET: D4-D33 LTV CALCULATION
+        ltv_target AS (
+        SELECT 
+            ic.user_id,
+            SUM(COALESCE(e.converted_revenue, 0)) as ltv_target,
+            SUM(COALESCE(e.converted_revenue, 0)) as received_ltv_target,
+            COUNTIF(COALESCE(e.converted_revenue, 0) > 0) as purchase_events_target
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) BETWEEN DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + 1} DAY) AND DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + PREDICTION_DAYS} DAY)
+        GROUP BY ic.user_id
+        ),
+
+        -- FEATURE ENGINEERING (Generic names)
+        basic_engagement_metrics AS (
+        SELECT 
+            user_id,
+            COUNT(*) as total_events,
+            COUNT(DISTINCT session_id) as total_sessions,
+            COUNT(DISTINCT DATE(event_timestamp)) as active_days,
+            
+            -- Period-based events (generic names)
+            COUNTIF(day_offset = 0) as period_1_events,        -- Day 0 events
+            COUNTIF(day_offset = 1) as period_2_events,        -- Day 1 events  
+            COUNTIF(day_offset = 2) as period_3_events,        -- Day 2 events
+            COUNTIF(day_offset = 3) as period_4_events,        -- Day 3 events
+            
+            -- Period-based sessions (generic names)
+            COUNT(DISTINCT CASE WHEN day_offset = 0 THEN session_id END) as period_1_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset = 1 THEN session_id END) as period_2_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset = 2 THEN session_id END) as period_3_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset = 3 THEN session_id END) as period_4_sessions,
+            
+            -- Retention flags (generic names)
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset >= 1 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as next_period_retained,
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset >= 2 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as period_plus_2_retained,
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset >= 3 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as period_plus_3_retained,
+            
+            MIN(event_timestamp) as first_event_timestamp,
+            MAX(event_timestamp) as last_event_timestamp
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        time_pattern_features AS (
+        SELECT 
+            user_id,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) BETWEEN 9 AND 17) as business_hours_events,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) BETWEEN 18 AND 22) as evening_events,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) >= 23 OR EXTRACT(HOUR FROM event_timestamp) <= 6) as late_night_events,
+            COUNTIF(EXTRACT(DAYOFWEEK FROM event_timestamp) IN (1, 7)) as weekend_events,
+            COUNT(DISTINCT EXTRACT(HOUR FROM event_timestamp)) as active_hours_spread,
+            COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM event_timestamp)) as active_days_of_week,
+            COUNTIF(is_fingerprinted = true) as fingerprinted_events,
+            COUNTIF(is_reengagement = true) as reengagement_events,
+            COUNTIF(is_view_through = true) as view_through_events
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        game_specific_features AS (
+        SELECT 
+            user_id,
+            COUNTIF(LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%') as tutorial_completions,
+            CASE WHEN COUNTIF(LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%') > 0 THEN 1 ELSE 0 END as tutorial_completed_flag,
+            MIN(CASE WHEN LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%' THEN event_timestamp END) as tutorial_completion_timestamp,
+            COUNTIF(LOWER(name) LIKE '%level_progress%' OR LOWER(name) LIKE '%level%complete%') as levels_completed,
+            MAX(CASE 
+            WHEN LOWER(name) LIKE '%level_progress%' OR LOWER(name) LIKE '%level%complete%'
+            THEN SAFE_CAST(COALESCE(
+                JSON_EXTRACT_SCALAR(arguments, '$.content_level_number'),
+                JSON_EXTRACT_SCALAR(arguments, '$.level'),
+                JSON_EXTRACT_SCALAR(arguments, '$.level_number')
+            ) AS INT64) 
+            END) as max_level_reached,
+            COUNTIF(LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') as total_ads_viewed,
+            COUNTIF(
+            (LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') AND 
+            (LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_placement_name')) LIKE '%reward%' OR
+            LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_type')) LIKE '%reward%' OR
+            LOWER(name) LIKE '%reward%')
+            ) as rewarded_ads_viewed,
+            COUNTIF(
+            (LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') AND 
+            (LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_placement_name')) LIKE '%interstitial%' OR
+            LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_type')) LIKE '%interstitial%' OR
+            LOWER(name) LIKE '%interstitial%')
+            ) as interstitial_ads_viewed,
+            COUNTIF(LOWER(name) LIKE '%store%' OR LOWER(name) LIKE '%shop%') as store_views,
+            COUNTIF(LOWER(name) LIKE '%purchase%intent%' OR LOWER(name) LIKE '%iap%click%') as purchase_intents,
+            COUNTIF(LOWER(name) = 'currency_earned') as currency_earned_events,
+            COUNTIF(LOWER(name) = 'currency_spent') as currency_spent_events,
+            COUNTIF(product_name IS NOT NULL AND COALESCE(product_price, 0) = 0) as product_interactions_non_revenue,
+            COUNT(DISTINCT CASE WHEN product_name IS NOT NULL AND COALESCE(product_price, 0) = 0 THEN product_name END) as unique_products_viewed,
+            COUNT(DISTINCT CASE WHEN product_sku IS NOT NULL AND COALESCE(product_price, 0) = 0 THEN product_sku END) as unique_skus_viewed,
+            COUNTIF(LOWER(name) LIKE '%social%' OR LOWER(name) LIKE '%share%' OR LOWER(name) LIKE '%invite%') as social_events,
+            COUNTIF(LOWER(name) LIKE '%achievement%' OR LOWER(name) LIKE '%trophy%' OR LOWER(name) LIKE '%leaderboard%') as achievement_events
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        session_timing_features AS (
+        SELECT 
+            user_id,
+            AVG(session_duration_minutes) as avg_session_length,
+            SUM(session_duration_minutes) as total_playtime_mins,
+            MAX(session_duration_minutes) as max_session_length,
+            MIN(CASE WHEN session_rank = 1 THEN session_start_hour END) as first_session_hour,
+            MIN(CASE WHEN session_rank = 1 THEN session_day_of_week END) as first_session_day_of_week
+        FROM (
+            SELECT 
+            user_id,
+            session_id,
+            MIN(event_timestamp) as session_start,
+            MAX(event_timestamp) as session_end,
+            EXTRACT(HOUR FROM MIN(event_timestamp)) as session_start_hour,
+            EXTRACT(DAYOFWEEK FROM MIN(event_timestamp)) as session_day_of_week,
+            TIMESTAMP_DIFF(MAX(event_timestamp), MIN(event_timestamp), MINUTE) as session_duration_minutes,
+            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY MIN(event_timestamp)) as session_rank
+            FROM feature_window_events
+            WHERE session_id IS NOT NULL AND user_id IS NOT NULL
+            GROUP BY user_id, session_id
+        )
+        GROUP BY user_id
+        )
+
+        -- FINAL TRAIN DATA OUTPUT
+        SELECT 
+        ud.user_id,
+        ud.install_date,
+        ud.install_timestamp,
         
-        -- Session and engagement metrics (behavioral only)
-        COUNT(DISTINCT e.session_id) AS total_sessions,
-        COUNT(*) AS total_events,
-        COUNT(DISTINCT DATE(e.attribution_event_timestamp)) AS active_days,
+        -- Demographics
+        ud.country,
+        ud.city,
+        ud.state,
+        ud.platform,
+        ud.os_version,
+        ud.app_version,
+        ud.install_source,
+        ud.campaign_name,
+        ud.partner,
+        ud.publisher_name,
         
-        -- Timing patterns
-        MIN(e.attribution_event_timestamp) AS first_event,
-        MAX(e.attribution_event_timestamp) AS last_event,
+        -- Basic engagement metrics (generic names)
+        COALESCE(bem.total_events, 0) as total_events,
+        COALESCE(bem.total_sessions, 0) as total_sessions,
+        COALESCE(bem.active_days, 0) as active_days,
+        COALESCE(bem.period_1_events, 0) as period_1_events,
+        COALESCE(bem.period_2_events, 0) as period_2_events,
+        COALESCE(bem.period_3_events, 0) as period_3_events,
+        COALESCE(bem.period_4_events, 0) as period_4_events,
+        COALESCE(bem.period_1_sessions, 0) as period_1_sessions,
+        COALESCE(bem.period_2_sessions, 0) as period_2_sessions,
+        COALESCE(bem.period_3_sessions, 0) as period_3_sessions,
+        COALESCE(bem.period_4_sessions, 0) as period_4_sessions,
+        COALESCE(bem.next_period_retained, 0) as next_period_retained,
+        COALESCE(bem.period_plus_2_retained, 0) as period_plus_2_retained,
+        COALESCE(bem.period_plus_3_retained, 0) as period_plus_3_retained,
         
-        -- Product interaction behavioral patterns (NO REVENUE DATA)
-        COUNT(CASE WHEN e.product_name IS NOT NULL THEN 1 END) AS product_interactions,
-        COUNT(DISTINCT e.product_name) AS unique_products_viewed,
-        COUNT(DISTINCT e.product_sku) AS unique_skus_viewed,
-        AVG(SAFE_CAST(e.product_quantity AS FLOAT64)) AS avg_quantity_per_interaction,
-        SUM(SAFE_CAST(e.product_quantity AS FLOAT64)) AS total_quantity_interactions,
+        -- Time patterns
+        COALESCE(tpf.business_hours_events, 0) as business_hours_events,
+        COALESCE(tpf.evening_events, 0) as evening_events,
+        COALESCE(tpf.late_night_events, 0) as late_night_events,
+        COALESCE(tpf.weekend_events, 0) as weekend_events,
+        COALESCE(tpf.active_hours_spread, 0) as active_hours_spread,
+        COALESCE(tpf.active_days_of_week, 0) as active_days_of_week,
+        COALESCE(tpf.fingerprinted_events, 0) as fingerprinted_events,
+        COALESCE(tpf.reengagement_events, 0) as reengagement_events,
+        COALESCE(tpf.view_through_events, 0) as view_through_events,
         
-        -- Platform and attribution
-        MAX(CASE WHEN e.gaid IS NOT NULL THEN 'android' 
-                WHEN e.idfa IS NOT NULL THEN 'ios' 
-                ELSE 'unknown' END) AS platform,
-        MAX(e.country) AS country,
-        MAX(e.install_source) AS install_source,
-        MAX(e.city) AS city,
-        MAX(e.state) AS state,
+        -- Game features
+        COALESCE(gsf.tutorial_completed_flag, 0) as tutorial_completed_flag,
+        gsf.tutorial_completion_timestamp,
+        COALESCE(gsf.levels_completed, 0) as levels_completed,
+        COALESCE(gsf.max_level_reached, 0) as max_level_reached,
+        COALESCE(gsf.total_ads_viewed, 0) as total_ads_viewed,
+        COALESCE(gsf.rewarded_ads_viewed, 0) as rewarded_ads_viewed,
+        COALESCE(gsf.interstitial_ads_viewed, 0) as interstitial_ads_viewed,
+        COALESCE(gsf.store_views, 0) as store_views,
+        COALESCE(gsf.purchase_intents, 0) as purchase_intents,
+        COALESCE(gsf.currency_earned_events, 0) as currency_earned_events,
+        COALESCE(gsf.currency_spent_events, 0) as currency_spent_events,
+        COALESCE(gsf.product_interactions_non_revenue, 0) as product_interactions_non_revenue,
+        COALESCE(gsf.unique_products_viewed, 0) as unique_products_viewed,
+        COALESCE(gsf.unique_skus_viewed, 0) as unique_skus_viewed,
+        COALESCE(gsf.social_events, 0) as social_events,
+        COALESCE(gsf.achievement_events, 0) as achievement_events,
         
-        -- Campaign and attribution features (behavioral)
-        MAX(e.campaign_name) AS campaign_name,
-        MAX(e.partner) AS partner,
-        MAX(e.publisher_name) AS publisher_name,
-        COUNTIF(e.is_fingerprinted = true) AS fingerprinted_events,
-        COUNTIF(e.is_reengagement = true) AS reengagement_events,
-        COUNTIF(e.is_view_through = true) AS view_through_events,
+        -- Session timing
+        COALESCE(stf.avg_session_length, 0) as avg_session_length,
+        COALESCE(stf.total_playtime_mins, 0) as total_playtime_mins,
+        COALESCE(stf.max_session_length, 0) as max_session_length,
+        stf.first_session_hour,
+        stf.first_session_day_of_week,
         
-        -- Time-based behavioral patterns
-        COUNTIF(EXTRACT(HOUR FROM e.attribution_event_timestamp) BETWEEN 9 AND 17) AS business_hours_events,
-        COUNTIF(EXTRACT(DAYOFWEEK FROM e.attribution_event_timestamp) IN (1, 7)) AS weekend_events,
-        COUNTIF(EXTRACT(HOUR FROM e.attribution_event_timestamp) BETWEEN 18 AND 23) AS evening_events,
-        COUNTIF(EXTRACT(HOUR FROM e.attribution_event_timestamp) BETWEEN 0 AND 6) AS late_night_events,
+        -- Install timing
+        EXTRACT(HOUR FROM ud.install_timestamp) as install_hour,
+        EXTRACT(DAYOFWEEK FROM ud.install_timestamp) as install_day_of_week,
+        EXTRACT(MONTH FROM ud.install_timestamp) as install_month,
+        TIMESTAMP_DIFF(bem.first_event_timestamp, ud.install_timestamp, MINUTE) as minutes_install_to_first_event,
+        TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) as minutes_install_to_tutorial,
         
-        -- Session depth indicators
-        COUNT(DISTINCT e.session_id) / COUNT(DISTINCT DATE(e.attribution_event_timestamp)) AS avg_sessions_per_day,
-        COUNT(*) / COUNT(DISTINCT e.session_id) AS avg_events_per_session,
+        -- Advanced categorical features
+        CASE 
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 0 AND 5 THEN 'late_night_install'
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 6 AND 11 THEN 'morning_install' 
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 12 AND 17 THEN 'afternoon_install'
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 18 AND 23 THEN 'evening_install'
+        END as install_time_segment,
         
-        -- Advanced ad engagement features (behavioral only, no revenue)
-        -- Note: event_name field not available, using alternative engagement metrics
-        0 AS ad_interaction_events,
-        0 AS ad_click_events,
-        0 AS ad_view_events,
-        0 AS video_ad_events,
-        0 AS store_browse_events,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 1 THEN 1 ELSE 0 END as install_sunday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 2 THEN 1 ELSE 0 END as install_monday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 3 THEN 1 ELSE 0 END as install_tuesday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 4 THEN 1 ELSE 0 END as install_wednesday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 5 THEN 1 ELSE 0 END as install_thursday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 6 THEN 1 ELSE 0 END as install_friday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 7 THEN 1 ELSE 0 END as install_saturday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) IN (1, 7) THEN 1 ELSE 0 END as weekend_install,
         
-        -- Social and sharing features (engagement indicators)
-        -- Note: event_name field not available, using alternative engagement metrics
-        0 AS social_share_events,
-        0 AS social_invite_events,
-        0 AS tutorial_completion_events,
-        0 AS game_progress_events,
-        0 AS achievement_events,
+        -- OS sophistication
+        CASE 
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 13 THEN 'android_premium'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 11 THEN 'android_modern'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 9 THEN 'android_standard'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 7 THEN 'android_legacy'
+            WHEN ud.platform = 'android' THEN 'android_ancient'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 16 THEN 'ios_premium'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 14 THEN 'ios_modern'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 12 THEN 'ios_standard'
+            ELSE 'ios_legacy'
+        END as os_sophistication_tier,
         
-        -- App quality and technical engagement features
-        -- Note: event_name field not available, using alternative engagement metrics
-        0 AS error_events,
-        0 AS notification_events,
-        0 AS settings_interaction_events,
-        0 AS search_events,
+        -- Country economic tier
+        CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'NL', 'CH', 'NO', 'SE', 'DK') THEN 'tier_1_economy'
+            WHEN ud.country IN ('JP', 'KR', 'FR', 'IT', 'ES', 'BE', 'AT', 'FI', 'IE', 'NZ') THEN 'tier_1b_economy'
+            WHEN ud.country IN ('CN', 'SG', 'HK', 'TW', 'AE', 'QA', 'KW', 'SA', 'BH', 'OM') THEN 'tier_2_economy'
+            WHEN ud.country IN ('BR', 'MX', 'AR', 'CL', 'RU', 'TR', 'PL', 'CZ', 'HU', 'GR') THEN 'tier_3_economy'
+            WHEN ud.country IN ('IN', 'ID', 'TH', 'MY', 'PH', 'VN', 'ZA', 'EG', 'CO', 'PE') THEN 'tier_4_economy'
+            ELSE 'tier_5_economy'
+        END as economic_tier,
         
-        -- Deep engagement features
-        1 AS unique_event_types,
-        COUNT(DISTINCT EXTRACT(HOUR FROM e.attribution_event_timestamp)) AS active_hours_spread,
-        COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM e.attribution_event_timestamp)) AS active_days_of_week,
+        -- Device tier
+        CASE 
+            WHEN ud.platform = 'ios' THEN 'premium_platform'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 12 THEN 'premium_android'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 9 THEN 'mid_tier_android'
+            ELSE 'budget_android'
+        END as device_tier,
         
-        -- Retention and re-engagement patterns
-        DATE_DIFF(MAX(DATE(e.attribution_event_timestamp)), MIN(DATE(e.attribution_event_timestamp)), DAY) AS activity_span_days,
-        COUNT(DISTINCT DATE(e.attribution_event_timestamp)) / (DATE_DIFF(MAX(DATE(e.attribution_event_timestamp)), MIN(DATE(e.attribution_event_timestamp)), DAY) + 1) AS activity_consistency_ratio
-                
-      FROM `{table_path}` e
-      JOIN install_dates i ON COALESCE(e.gaid, e.idfa, e.android_id, e.waid, e.idfv) = i.user_id
-      WHERE DATE(e.attribution_event_timestamp) BETWEEN i.install_date 
-        AND DATE_ADD(i.install_date, INTERVAL {FEATURE_DAYS} DAY)
-      GROUP BY user_id, i.install_date, i.install_timestamp
-    ),
-    
-    ltv_targets AS (
-      SELECT
-        COALESCE(e.gaid, e.idfa, e.android_id, e.waid, e.idfv) AS user_id,
-        -- Only use revenue fields for TARGET calculation (not features)
-        COALESCE(SUM(SAFE_CAST(e.revenue AS FLOAT64)), 0) AS ltv_30_days,
-        COALESCE(SUM(SAFE_CAST(e.received_revenue AS FLOAT64)), 0) AS received_ltv_30_days,
-        COUNT(CASE WHEN SAFE_CAST(e.revenue AS FLOAT64) > 0 THEN 1 END) AS purchase_events
-      FROM `{table_path}` e
-      JOIN install_dates i ON COALESCE(e.gaid, e.idfa, e.android_id, e.waid, e.idfv) = i.user_id
-      WHERE DATE(e.attribution_event_timestamp) BETWEEN DATE_ADD(i.install_date, INTERVAL {FEATURE_DAYS + 1} DAY)
-        AND DATE_ADD(i.install_date, INTERVAL {FEATURE_DAYS + PREDICTION_DAYS} DAY)
-      GROUP BY user_id
-    )
-    
-    SELECT 
-      f.*,
-      -- Derived behavioral features
-      TIMESTAMP_DIFF(f.last_event, f.first_event, MINUTE) AS session_duration_minutes,
-      TIMESTAMP_DIFF(f.first_event, f.install_timestamp, MINUTE) AS time_to_first_session_minutes,
-      
-      -- Engagement intensity features
-      SAFE_DIVIDE(f.total_events, f.total_sessions) AS events_per_session,
-      SAFE_DIVIDE(f.product_interactions, f.total_sessions) AS product_interactions_per_session,
-      SAFE_DIVIDE(f.unique_products_viewed, NULLIF(f.product_interactions, 0)) AS product_diversity_rate,
-      SAFE_DIVIDE(f.product_interactions, f.total_events) AS product_engagement_rate,
-      SAFE_DIVIDE(f.total_events, f.active_days) AS events_per_active_day,
-      SAFE_DIVIDE(f.business_hours_events, f.total_events) AS business_hours_ratio,
-      SAFE_DIVIDE(f.weekend_events, f.total_events) AS weekend_activity_ratio,
-      SAFE_DIVIDE(f.evening_events, f.total_events) AS evening_activity_ratio,
-      SAFE_DIVIDE(f.late_night_events, f.total_events) AS late_night_ratio,
-      SAFE_DIVIDE(f.fingerprinted_events, f.total_events) AS fingerprinted_ratio,
-      SAFE_DIVIDE(f.reengagement_events, f.total_events) AS reengagement_ratio,
-      
-      -- Advanced ad engagement ratios
-      SAFE_DIVIDE(f.ad_interaction_events, f.total_events) AS ad_interaction_ratio,
-      SAFE_DIVIDE(f.ad_click_events, NULLIF(f.ad_view_events, 0)) AS ad_click_through_rate,
-      SAFE_DIVIDE(f.video_ad_events, NULLIF(f.ad_interaction_events, 0)) AS video_ad_preference_ratio,
-      SAFE_DIVIDE(f.store_browse_events, f.total_events) AS store_browse_ratio,
-      
-      -- Social engagement ratios
-      SAFE_DIVIDE(f.social_share_events + f.social_invite_events, f.total_events) AS social_engagement_ratio,
-      SAFE_DIVIDE(f.tutorial_completion_events, f.total_sessions) AS tutorial_completion_rate,
-      SAFE_DIVIDE(f.game_progress_events, f.total_events) AS game_progress_ratio,
-      SAFE_DIVIDE(f.achievement_events, f.total_events) AS achievement_ratio,
-      
-      -- App quality metrics
-      SAFE_DIVIDE(f.error_events, f.total_events) AS error_rate,
-      SAFE_DIVIDE(f.notification_events, f.total_events) AS notification_engagement_ratio,
-      SAFE_DIVIDE(f.settings_interaction_events, f.total_sessions) AS customization_ratio,
-      SAFE_DIVIDE(f.search_events, f.total_events) AS search_behavior_ratio,
-      
-      -- Deep engagement metrics
-      SAFE_DIVIDE(f.unique_event_types, f.total_events) AS event_diversity_ratio,
-      SAFE_DIVIDE(f.active_hours_spread, 24) AS time_diversity_ratio,
-      SAFE_DIVIDE(f.active_days_of_week, 7) AS weekly_consistency_ratio,
-      
-      -- Target variable (revenue-based but only for labels)
-      COALESCE(t.ltv_30_days, 0) AS ltv_30_days,
-      COALESCE(t.received_ltv_30_days, 0) AS received_ltv_30_days,
-      COALESCE(t.purchase_events, 0) AS purchase_events
-      
-    FROM behavioral_features f
-    LEFT JOIN ltv_targets t ON f.user_id = t.user_id
-    WHERE f.total_sessions > 0 AND f.active_days > 0
-    ORDER BY RAND()
+        -- Ad behavior
+        CASE 
+            WHEN COALESCE(gsf.rewarded_ads_viewed, 0) >= 5 AND COALESCE(gsf.interstitial_ads_viewed, 0) <= 2 THEN 'reward_seeker'
+            WHEN COALESCE(gsf.interstitial_ads_viewed, 0) >= 3 AND COALESCE(gsf.rewarded_ads_viewed, 0) <= 1 THEN 'ad_tolerant'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 8 THEN 'high_ad_engagement'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 3 THEN 'moderate_ad_engagement'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 1 THEN 'low_ad_engagement'
+            ELSE 'ad_avoider'
+        END as ad_behavior_profile,
+        
+        -- Tutorial completion speed
+        CASE 
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 5 THEN 'instant_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 15 THEN 'fast_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 60 THEN 'slow_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 THEN 'very_slow_tutorial'
+            ELSE 'no_tutorial'
+        END as tutorial_completion_speed,
+        
+        -- Progression tier
+        CASE 
+            WHEN COALESCE(gsf.levels_completed, 0) >= 10 THEN 'fast_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 5 THEN 'moderate_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 2 THEN 'slow_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 1 THEN 'minimal_progressor'
+            ELSE 'non_progressor'
+        END as progression_tier,
+        
+        -- Calculated ratios (generic names)
+        SAFE_DIVIDE(COALESCE(bem.total_events, 0), NULLIF(COALESCE(bem.total_sessions, 0), 0)) as avg_events_per_session,
+        SAFE_DIVIDE(COALESCE(bem.total_events, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as avg_events_per_active_day,
+        SAFE_DIVIDE(COALESCE(bem.total_sessions, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as avg_sessions_per_day,
+        SAFE_DIVIDE(COALESCE(tpf.business_hours_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as business_hours_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.evening_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as evening_activity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.weekend_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as weekend_activity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.late_night_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as late_night_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.rewarded_ads_viewed, 0), NULLIF(COALESCE(gsf.total_ads_viewed, 0), 0)) as rewarded_ad_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.total_ads_viewed, 0), NULLIF(COALESCE(bem.total_sessions, 0), 0)) as ads_per_session,
+        SAFE_DIVIDE(COALESCE(gsf.total_ads_viewed, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as ad_engagement_rate,
+        SAFE_DIVIDE(COALESCE(gsf.product_interactions_non_revenue, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as product_interest_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.store_views, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as store_engagement_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.purchase_intents, 0), NULLIF(COALESCE(gsf.store_views, 0), 0)) as store_conversion_intent_rate,
+        SAFE_DIVIDE(COALESCE(gsf.levels_completed, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as levels_per_day,
+        SAFE_DIVIDE(COALESCE(gsf.levels_completed, 0), NULLIF(COALESCE(bem.period_1_sessions, 0), 0)) as levels_per_session,
+        
+        -- Period growth ratios (generic names)
+        SAFE_DIVIDE(COALESCE(bem.period_2_events, 0), NULLIF(COALESCE(bem.period_1_events, 0), 0)) as period_2_to_1_growth_ratio,
+        SAFE_DIVIDE(COALESCE(bem.period_4_events, 0), NULLIF(COALESCE(bem.period_1_events, 0), 0)) as period_4_to_1_growth_ratio,
+        SAFE_DIVIDE(COALESCE(bem.period_2_sessions, 0), NULLIF(COALESCE(bem.period_1_sessions, 0), 0)) as session_growth_period_1_to_2,
+        
+        SAFE_DIVIDE(COALESCE(bem.active_days, 0), 4) as activity_consistency_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.active_hours_spread, 0), 24) as time_diversity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.active_days_of_week, 0), 7) as weekly_consistency_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.fingerprinted_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as fingerprinted_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.reengagement_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as reengagement_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.view_through_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as view_through_ratio,
+        
+        -- Platform × Country combo
+        CONCAT(
+            CASE WHEN ud.platform = 'ios' THEN 'ios' ELSE 'android' END,
+            '_',
+            CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU') THEN 'premium_geo'
+            WHEN ud.country IN ('JP', 'KR', 'FR', 'IT', 'ES') THEN 'good_geo'
+            WHEN ud.country IN ('CN', 'BR', 'RU', 'IN', 'MX') THEN 'medium_geo'
+            ELSE 'other_geo'
+            END
+        ) as platform_geo_combo,
+        
+        -- Monetization potential
+        CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'NL', 'CH', 'NO', 'SE', 'DK') 
+                AND ud.platform = 'ios' 
+                AND COALESCE(gsf.tutorial_completed_flag, 0) = 1 
+                AND COALESCE(gsf.total_ads_viewed, 0) >= 3 THEN 'high_monetization_potential'
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'JP', 'KR', 'FR', 'IT', 'ES') 
+                AND COALESCE(gsf.tutorial_completed_flag, 0) = 1 
+                AND COALESCE(bem.period_1_sessions, 0) >= 3 THEN 'medium_monetization_potential'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 OR COALESCE(bem.period_1_sessions, 0) >= 2 THEN 'low_monetization_potential'
+            ELSE 'minimal_monetization_potential'
+        END as monetization_potential_tier,
+        
+        -- ==========================================
+        -- TARGET VARIABLES (D4-D33 LTV)
+        -- ==========================================
+        COALESCE(lt.ltv_target, 0) as ltv_target,
+        COALESCE(lt.received_ltv_target, 0) as received_ltv_target,
+        COALESCE(lt.purchase_events_target, 0) as purchase_events_target
+
+        FROM user_demographics ud
+        LEFT JOIN basic_engagement_metrics bem ON ud.user_id = bem.user_id
+        LEFT JOIN time_pattern_features tpf ON ud.user_id = tpf.user_id
+        LEFT JOIN game_specific_features gsf ON ud.user_id = gsf.user_id
+        LEFT JOIN session_timing_features stf ON ud.user_id = stf.user_id
+        LEFT JOIN ltv_target lt ON ud.user_id = lt.user_id
+        WHERE COALESCE(bem.total_events, 0) >= 1  -- At least some activity
+        ORDER BY ud.install_date, ud.user_id;
+
+    """
+    val_query = f"""
+        WITH install_cohort AS (
+        -- Get install date for April installs
+        SELECT 
+            COALESCE(gaid, idfa, android_id, custom_user_id) as user_id,
+            DATE(MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64))))) as install_date,
+            MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) as install_timestamp
+        FROM {table_path}
+        WHERE DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) >= '2025-01-01'
+            AND DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) <= '2025-02-28'
+            AND COALESCE(gaid, idfa, android_id, custom_user_id) IS NOT NULL
+            AND COALESCE(gaid, idfa, android_id, custom_user_id) != ''  -- Remove empty user IDs
+        GROUP BY COALESCE(gaid, idfa, android_id, custom_user_id)
+        ),
+
+        user_demographics AS (
+        -- Basic demographics and attribution info
+        SELECT 
+            ic.user_id,
+            ic.install_date,
+            ic.install_timestamp,
+            
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.country END) as country,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.city END) as city,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.state END) as state,
+            
+            -- Derive platform
+            ANY_VALUE(CASE 
+            WHEN e.idfa IS NOT NULL OR e.idfa_md5 IS NOT NULL OR e.idfv IS NOT NULL THEN 'ios'
+            WHEN e.gaid IS NOT NULL OR e.android_id IS NOT NULL THEN 'android'
+            ELSE 'unknown'
+            END) as platform,
+            
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.os_version END) as os_version,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.app_version END) as app_version,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.install_source END) as install_source,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.campaign_name END) as campaign_name,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.partner END) as partner,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.publisher_name END) as publisher_name
+            
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date
+        GROUP BY ic.user_id, ic.install_date, ic.install_timestamp
+        ),
+
+        -- D4-D33 FEATURE WINDOW for test data (maps to generic period names)
+        feature_window_events AS (
+        SELECT 
+            ic.user_id,
+            COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64))) as event_timestamp,
+            e.session_id,
+            e.name,
+            e.arguments,
+            e.product_name,
+            e.product_sku,
+            e.product_category,
+            e.product_price,
+            e.product_quantity,
+            COALESCE(e.is_fingerprinted, false) as is_fingerprinted,
+            COALESCE(e.is_reengagement, false) as is_reengagement,
+            COALESCE(e.is_view_through, false) as is_view_through,
+            DATE_DIFF(DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))), ic.install_date, DAY) as day_offset
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) BETWEEN DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + 1} DAY) AND DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + PREDICTION_DAYS} DAY)
+        WHERE e.name IS NOT NULL
+        ),
+
+        -- TARGET: D4-D33 LTV CALCULATION (same window as features for test data)
+        ltv_target AS (
+        SELECT 
+            ic.user_id,
+            SUM(COALESCE(e.converted_revenue, 0)) as ltv_target,
+            SUM(COALESCE(e.converted_revenue, 0)) as received_ltv_target,
+            COUNTIF(COALESCE(e.converted_revenue, 0) > 0) as purchase_events_target
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) BETWEEN DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + 1} DAY) AND DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + PREDICTION_DAYS} DAY)
+        GROUP BY ic.user_id
+        ),
+
+        -- FEATURE ENGINEERING (D4-D33 mapped to generic period names)
+        basic_engagement_metrics AS (
+        SELECT 
+            user_id,
+            COUNT(*) as total_events,
+            COUNT(DISTINCT session_id) as total_sessions,
+            COUNT(DISTINCT DATE(event_timestamp)) as active_days,
+            
+            -- Map D4-D33 to generic period names (same as train data structure)
+            COUNTIF(day_offset BETWEEN 4 AND 10) as period_1_events,      -- Days 4-10 → Period 1
+            COUNTIF(day_offset BETWEEN 11 AND 17) as period_2_events,     -- Days 11-17 → Period 2
+            COUNTIF(day_offset BETWEEN 18 AND 25) as period_3_events,     -- Days 18-25 → Period 3
+            COUNTIF(day_offset BETWEEN 26 AND 33) as period_4_events,     -- Days 26-33 → Period 4
+            
+            -- Session breakdown (same generic names)
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 4 AND 10 THEN session_id END) as period_1_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 11 AND 17 THEN session_id END) as period_2_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 18 AND 25 THEN session_id END) as period_3_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 26 AND 33 THEN session_id END) as period_4_sessions,
+            
+            -- Retention flags (same generic names)
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset BETWEEN 11 AND 33 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as next_period_retained,
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset BETWEEN 18 AND 33 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as period_plus_2_retained,
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset BETWEEN 26 AND 33 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as period_plus_3_retained,
+            
+            MIN(event_timestamp) as first_event_timestamp,
+            MAX(event_timestamp) as last_event_timestamp
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        time_pattern_features AS (
+        SELECT 
+            user_id,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) BETWEEN 9 AND 17) as business_hours_events,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) BETWEEN 18 AND 22) as evening_events,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) >= 23 OR EXTRACT(HOUR FROM event_timestamp) <= 6) as late_night_events,
+            COUNTIF(EXTRACT(DAYOFWEEK FROM event_timestamp) IN (1, 7)) as weekend_events,
+            COUNT(DISTINCT EXTRACT(HOUR FROM event_timestamp)) as active_hours_spread,
+            COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM event_timestamp)) as active_days_of_week,
+            COUNTIF(is_fingerprinted = true) as fingerprinted_events,
+            COUNTIF(is_reengagement = true) as reengagement_events,
+            COUNTIF(is_view_through = true) as view_through_events
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        game_specific_features AS (
+        SELECT 
+            user_id,
+            COUNTIF(LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%') as tutorial_completions,
+            CASE WHEN COUNTIF(LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%') > 0 THEN 1 ELSE 0 END as tutorial_completed_flag,
+            MIN(CASE WHEN LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%' THEN event_timestamp END) as tutorial_completion_timestamp,
+            COUNTIF(LOWER(name) LIKE '%level_progress%' OR LOWER(name) LIKE '%level%complete%') as levels_completed,
+            MAX(CASE 
+            WHEN LOWER(name) LIKE '%level_progress%' OR LOWER(name) LIKE '%level%complete%'
+            THEN SAFE_CAST(COALESCE(
+                JSON_EXTRACT_SCALAR(arguments, '$.content_level_number'),
+                JSON_EXTRACT_SCALAR(arguments, '$.level'),
+                JSON_EXTRACT_SCALAR(arguments, '$.level_number')
+            ) AS INT64) 
+            END) as max_level_reached,
+            COUNTIF(LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') as total_ads_viewed,
+            COUNTIF(
+            (LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') AND 
+            (LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_placement_name')) LIKE '%reward%' OR
+            LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_type')) LIKE '%reward%' OR
+            LOWER(name) LIKE '%reward%')
+            ) as rewarded_ads_viewed,
+            COUNTIF(
+            (LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') AND 
+            (LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_placement_name')) LIKE '%interstitial%' OR
+            LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_type')) LIKE '%interstitial%' OR
+            LOWER(name) LIKE '%interstitial%')
+            ) as interstitial_ads_viewed,
+            COUNTIF(LOWER(name) LIKE '%store%' OR LOWER(name) LIKE '%shop%') as store_views,
+            COUNTIF(LOWER(name) LIKE '%purchase%intent%' OR LOWER(name) LIKE '%iap%click%') as purchase_intents,
+            COUNTIF(LOWER(name) = 'currency_earned') as currency_earned_events,
+            COUNTIF(LOWER(name) = 'currency_spent') as currency_spent_events,
+            COUNTIF(product_name IS NOT NULL AND COALESCE(product_price, 0) = 0) as product_interactions_non_revenue,
+            COUNT(DISTINCT CASE WHEN product_name IS NOT NULL AND COALESCE(product_price, 0) = 0 THEN product_name END) as unique_products_viewed,
+            COUNT(DISTINCT CASE WHEN product_sku IS NOT NULL AND COALESCE(product_price, 0) = 0 THEN product_sku END) as unique_skus_viewed,
+            COUNTIF(LOWER(name) LIKE '%social%' OR LOWER(name) LIKE '%share%' OR LOWER(name) LIKE '%invite%') as social_events,
+            COUNTIF(LOWER(name) LIKE '%achievement%' OR LOWER(name) LIKE '%trophy%' OR LOWER(name) LIKE '%leaderboard%') as achievement_events
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        session_timing_features AS (
+        SELECT 
+            user_id,
+            AVG(session_duration_minutes) as avg_session_length,
+            SUM(session_duration_minutes) as total_playtime_mins,
+            MAX(session_duration_minutes) as max_session_length,
+            MIN(CASE WHEN session_rank = 1 THEN session_start_hour END) as first_session_hour,
+            MIN(CASE WHEN session_rank = 1 THEN session_day_of_week END) as first_session_day_of_week
+        FROM (
+            SELECT 
+            user_id,
+            session_id,
+            MIN(event_timestamp) as session_start,
+            MAX(event_timestamp) as session_end,
+            EXTRACT(HOUR FROM MIN(event_timestamp)) as session_start_hour,
+            EXTRACT(DAYOFWEEK FROM MIN(event_timestamp)) as session_day_of_week,
+            TIMESTAMP_DIFF(MAX(event_timestamp), MIN(event_timestamp), MINUTE) as session_duration_minutes,
+            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY MIN(event_timestamp)) as session_rank
+            FROM feature_window_events
+            WHERE session_id IS NOT NULL AND user_id IS NOT NULL
+            GROUP BY user_id, session_id
+        )
+        GROUP BY user_id
+        )
+
+        -- FINAL TEST DATA OUTPUT - IDENTICAL STRUCTURE TO TRAIN DATA
+        SELECT 
+        ud.user_id,
+        ud.install_date,
+        ud.install_timestamp,
+        
+        -- Demographics
+        ud.country,
+        ud.city,
+        ud.state,
+        ud.platform,
+        ud.os_version,
+        ud.app_version,
+        ud.install_source,
+        ud.campaign_name,
+        ud.partner,
+        ud.publisher_name,
+        
+        -- Basic engagement metrics (SAME COLUMN NAMES as train data)
+        COALESCE(bem.total_events, 0) as total_events,
+        COALESCE(bem.total_sessions, 0) as total_sessions,
+        COALESCE(bem.active_days, 0) as active_days,
+        COALESCE(bem.period_1_events, 0) as period_1_events,
+        COALESCE(bem.period_2_events, 0) as period_2_events,
+        COALESCE(bem.period_3_events, 0) as period_3_events,
+        COALESCE(bem.period_4_events, 0) as period_4_events,
+        COALESCE(bem.period_1_sessions, 0) as period_1_sessions,
+        COALESCE(bem.period_2_sessions, 0) as period_2_sessions,
+        COALESCE(bem.period_3_sessions, 0) as period_3_sessions,
+        COALESCE(bem.period_4_sessions, 0) as period_4_sessions,
+        COALESCE(bem.next_period_retained, 0) as next_period_retained,
+        COALESCE(bem.period_plus_2_retained, 0) as period_plus_2_retained,
+        COALESCE(bem.period_plus_3_retained, 0) as period_plus_3_retained,
+        
+        -- Time patterns
+        COALESCE(tpf.business_hours_events, 0) as business_hours_events,
+        COALESCE(tpf.evening_events, 0) as evening_events,
+        COALESCE(tpf.late_night_events, 0) as late_night_events,
+        COALESCE(tpf.weekend_events, 0) as weekend_events,
+        COALESCE(tpf.active_hours_spread, 0) as active_hours_spread,
+        COALESCE(tpf.active_days_of_week, 0) as active_days_of_week,
+        COALESCE(tpf.fingerprinted_events, 0) as fingerprinted_events,
+        COALESCE(tpf.reengagement_events, 0) as reengagement_events,
+        COALESCE(tpf.view_through_events, 0) as view_through_events,
+        
+        -- Game features
+        COALESCE(gsf.tutorial_completed_flag, 0) as tutorial_completed_flag,
+        gsf.tutorial_completion_timestamp,
+        COALESCE(gsf.levels_completed, 0) as levels_completed,
+        COALESCE(gsf.max_level_reached, 0) as max_level_reached,
+        COALESCE(gsf.total_ads_viewed, 0) as total_ads_viewed,
+        COALESCE(gsf.rewarded_ads_viewed, 0) as rewarded_ads_viewed,
+        COALESCE(gsf.interstitial_ads_viewed, 0) as interstitial_ads_viewed,
+        COALESCE(gsf.store_views, 0) as store_views,
+        COALESCE(gsf.purchase_intents, 0) as purchase_intents,
+        COALESCE(gsf.currency_earned_events, 0) as currency_earned_events,
+        COALESCE(gsf.currency_spent_events, 0) as currency_spent_events,
+        COALESCE(gsf.product_interactions_non_revenue, 0) as product_interactions_non_revenue,
+        COALESCE(gsf.unique_products_viewed, 0) as unique_products_viewed,
+        COALESCE(gsf.unique_skus_viewed, 0) as unique_skus_viewed,
+        COALESCE(gsf.social_events, 0) as social_events,
+        COALESCE(gsf.achievement_events, 0) as achievement_events,
+        
+        -- Session timing
+        COALESCE(stf.avg_session_length, 0) as avg_session_length,
+        COALESCE(stf.total_playtime_mins, 0) as total_playtime_mins,
+        COALESCE(stf.max_session_length, 0) as max_session_length,
+        stf.first_session_hour,
+        stf.first_session_day_of_week,
+        
+        -- Install timing
+        EXTRACT(HOUR FROM ud.install_timestamp) as install_hour,
+        EXTRACT(DAYOFWEEK FROM ud.install_timestamp) as install_day_of_week,
+        EXTRACT(MONTH FROM ud.install_timestamp) as install_month,
+        TIMESTAMP_DIFF(bem.first_event_timestamp, ud.install_timestamp, MINUTE) as minutes_install_to_first_event,
+        TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) as minutes_install_to_tutorial,
+        
+        -- Advanced categorical features (IDENTICAL to train data)
+        CASE 
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 0 AND 5 THEN 'late_night_install'
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 6 AND 11 THEN 'morning_install' 
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 12 AND 17 THEN 'afternoon_install'
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 18 AND 23 THEN 'evening_install'
+        END as install_time_segment,
+        
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 1 THEN 1 ELSE 0 END as install_sunday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 2 THEN 1 ELSE 0 END as install_monday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 3 THEN 1 ELSE 0 END as install_tuesday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 4 THEN 1 ELSE 0 END as install_wednesday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 5 THEN 1 ELSE 0 END as install_thursday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 6 THEN 1 ELSE 0 END as install_friday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 7 THEN 1 ELSE 0 END as install_saturday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) IN (1, 7) THEN 1 ELSE 0 END as weekend_install,
+        
+        -- OS sophistication (IDENTICAL logic)
+        CASE 
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 11 THEN 'android_modern'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 9 THEN 'android_standard'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 7 THEN 'android_legacy'
+            WHEN ud.platform = 'android' THEN 'android_ancient'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 16 THEN 'ios_premium'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 14 THEN 'ios_modern'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 12 THEN 'ios_standard'
+            ELSE 'ios_legacy'
+        END as os_sophistication_tier,
+        
+        -- Country economic tier (IDENTICAL logic)
+        CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'NL', 'CH', 'NO', 'SE', 'DK') THEN 'tier_1_economy'
+            WHEN ud.country IN ('JP', 'KR', 'FR', 'IT', 'ES', 'BE', 'AT', 'FI', 'IE', 'NZ') THEN 'tier_1b_economy'
+            WHEN ud.country IN ('CN', 'SG', 'HK', 'TW', 'AE', 'QA', 'KW', 'SA', 'BH', 'OM') THEN 'tier_2_economy'
+            WHEN ud.country IN ('BR', 'MX', 'AR', 'CL', 'RU', 'TR', 'PL', 'CZ', 'HU', 'GR') THEN 'tier_3_economy'
+            WHEN ud.country IN ('IN', 'ID', 'TH', 'MY', 'PH', 'VN', 'ZA', 'EG', 'CO', 'PE') THEN 'tier_4_economy'
+            ELSE 'tier_5_economy'
+        END as economic_tier,
+        
+        -- Device tier (IDENTICAL logic)
+        CASE 
+            WHEN ud.platform = 'ios' THEN 'premium_platform'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 12 THEN 'premium_android'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 9 THEN 'mid_tier_android'
+            ELSE 'budget_android'
+        END as device_tier,
+        
+        -- Ad behavior (IDENTICAL logic)
+        CASE 
+            WHEN COALESCE(gsf.rewarded_ads_viewed, 0) >= 5 AND COALESCE(gsf.interstitial_ads_viewed, 0) <= 2 THEN 'reward_seeker'
+            WHEN COALESCE(gsf.interstitial_ads_viewed, 0) >= 3 AND COALESCE(gsf.rewarded_ads_viewed, 0) <= 1 THEN 'ad_tolerant'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 8 THEN 'high_ad_engagement'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 3 THEN 'moderate_ad_engagement'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 1 THEN 'low_ad_engagement'
+            ELSE 'ad_avoider'
+        END as ad_behavior_profile,
+        
+        -- Tutorial completion speed (IDENTICAL logic)
+        CASE 
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 5 THEN 'instant_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 15 THEN 'fast_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 60 THEN 'slow_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 THEN 'very_slow_tutorial'
+            ELSE 'no_tutorial'
+        END as tutorial_completion_speed,
+        
+        -- Progression tier (IDENTICAL logic)
+        CASE 
+            WHEN COALESCE(gsf.levels_completed, 0) >= 10 THEN 'fast_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 5 THEN 'moderate_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 2 THEN 'slow_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 1 THEN 'minimal_progressor'
+            ELSE 'non_progressor'
+        END as progression_tier,
+        
+        -- Calculated ratios (IDENTICAL column names and logic)
+        SAFE_DIVIDE(COALESCE(bem.total_events, 0), NULLIF(COALESCE(bem.total_sessions, 0), 0)) as avg_events_per_session,
+        SAFE_DIVIDE(COALESCE(bem.total_events, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as avg_events_per_active_day,
+        SAFE_DIVIDE(COALESCE(bem.total_sessions, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as avg_sessions_per_day,
+        SAFE_DIVIDE(COALESCE(tpf.business_hours_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as business_hours_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.evening_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as evening_activity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.weekend_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as weekend_activity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.late_night_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as late_night_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.rewarded_ads_viewed, 0), NULLIF(COALESCE(gsf.total_ads_viewed, 0), 0)) as rewarded_ad_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.total_ads_viewed, 0), NULLIF(COALESCE(bem.total_sessions, 0), 0)) as ads_per_session,
+        SAFE_DIVIDE(COALESCE(gsf.total_ads_viewed, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as ad_engagement_rate,
+        SAFE_DIVIDE(COALESCE(gsf.product_interactions_non_revenue, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as product_interest_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.store_views, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as store_engagement_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.purchase_intents, 0), NULLIF(COALESCE(gsf.store_views, 0), 0)) as store_conversion_intent_rate,
+        SAFE_DIVIDE(COALESCE(gsf.levels_completed, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as levels_per_day,
+        SAFE_DIVIDE(COALESCE(gsf.levels_completed, 0), NULLIF(COALESCE(bem.period_1_sessions, 0), 0)) as levels_per_session,
+        
+        -- Period growth ratios (IDENTICAL column names)
+        SAFE_DIVIDE(COALESCE(bem.period_2_events, 0), NULLIF(COALESCE(bem.period_1_events, 0), 0)) as period_2_to_1_growth_ratio,
+        SAFE_DIVIDE(COALESCE(bem.period_4_events, 0), NULLIF(COALESCE(bem.period_1_events, 0), 0)) as period_4_to_1_growth_ratio,
+        SAFE_DIVIDE(COALESCE(bem.period_2_sessions, 0), NULLIF(COALESCE(bem.period_1_sessions, 0), 0)) as session_growth_period_1_to_2,
+        
+        SAFE_DIVIDE(COALESCE(bem.active_days, 0), 4) as activity_consistency_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.active_hours_spread, 0), 24) as time_diversity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.active_days_of_week, 0), 7) as weekly_consistency_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.fingerprinted_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as fingerprinted_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.reengagement_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as reengagement_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.view_through_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as view_through_ratio,
+        
+        -- Platform × Country combo (IDENTICAL logic)
+        CONCAT(
+            CASE WHEN ud.platform = 'ios' THEN 'ios' ELSE 'android' END,
+            '_',
+            CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU') THEN 'premium_geo'
+            WHEN ud.country IN ('JP', 'KR', 'FR', 'IT', 'ES') THEN 'good_geo'
+            WHEN ud.country IN ('CN', 'BR', 'RU', 'IN', 'MX') THEN 'medium_geo'
+            ELSE 'other_geo'
+            END
+        ) as platform_geo_combo,
+        
+        -- Monetization potential (IDENTICAL logic)
+        CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'NL', 'CH', 'NO', 'SE', 'DK') 
+                AND ud.platform = 'ios' 
+                AND COALESCE(gsf.tutorial_completed_flag, 0) = 1 
+                AND COALESCE(gsf.total_ads_viewed, 0) >= 3 THEN 'high_monetization_potential'
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'JP', 'KR', 'FR', 'IT', 'ES') 
+                AND COALESCE(gsf.tutorial_completed_flag, 0) = 1 
+                AND COALESCE(bem.period_1_sessions, 0) >= 3 THEN 'medium_monetization_potential'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 OR COALESCE(bem.period_1_sessions, 0) >= 2 THEN 'low_monetization_potential'
+            ELSE 'minimal_monetization_potential'
+        END as monetization_potential_tier,
+        
+        -- ==========================================
+        -- TARGET VARIABLES (IDENTICAL column names)
+        -- ==========================================
+        COALESCE(lt.ltv_target, 0) as ltv_target,
+        COALESCE(lt.received_ltv_target, 0) as received_ltv_target,
+        COALESCE(lt.purchase_events_target, 0) as purchase_events_target
+
+        FROM user_demographics ud
+        LEFT JOIN basic_engagement_metrics bem ON ud.user_id = bem.user_id
+        LEFT JOIN time_pattern_features tpf ON ud.user_id = tpf.user_id
+        LEFT JOIN game_specific_features gsf ON ud.user_id = gsf.user_id
+        LEFT JOIN session_timing_features stf ON ud.user_id = stf.user_id
+        LEFT JOIN ltv_target lt ON ud.user_id = lt.user_id
+        WHERE COALESCE(bem.total_events, 0) >= 1  -- At least some activity in D4-D33 window
+        ORDER BY ud.install_date, ud.user_id;
+    """
+
+    test_query = f"""
+        WITH install_cohort AS (
+        -- Get install date for April installs
+        SELECT 
+            COALESCE(gaid, idfa, android_id, custom_user_id) as user_id,
+            DATE(MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64))))) as install_date,
+            MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) as install_timestamp
+        FROM {table_path}
+        WHERE DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) >= '2025-03-01'
+            AND DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) <= '2025-07-30'
+            AND COALESCE(gaid, idfa, android_id, custom_user_id) IS NOT NULL
+            AND COALESCE(gaid, idfa, android_id, custom_user_id) != ''  -- Remove empty user IDs
+        GROUP BY COALESCE(gaid, idfa, android_id, custom_user_id)
+        ),
+
+        user_demographics AS (
+        -- Basic demographics and attribution info
+        SELECT 
+            ic.user_id,
+            ic.install_date,
+            ic.install_timestamp,
+            
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.country END) as country,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.city END) as city,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.state END) as state,
+            
+            -- Derive platform
+            ANY_VALUE(CASE 
+            WHEN e.idfa IS NOT NULL OR e.idfa_md5 IS NOT NULL OR e.idfv IS NOT NULL THEN 'ios'
+            WHEN e.gaid IS NOT NULL OR e.android_id IS NOT NULL THEN 'android'
+            ELSE 'unknown'
+            END) as platform,
+            
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.os_version END) as os_version,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.app_version END) as app_version,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.install_source END) as install_source,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.campaign_name END) as campaign_name,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.partner END) as partner,
+            ANY_VALUE(CASE WHEN DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date THEN e.publisher_name END) as publisher_name
+            
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) = ic.install_date
+        GROUP BY ic.user_id, ic.install_date, ic.install_timestamp
+        ),
+
+        -- D4-D33 FEATURE WINDOW for test data (maps to generic period names)
+        feature_window_events AS (
+        SELECT 
+            ic.user_id,
+            COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64))) as event_timestamp,
+            e.session_id,
+            e.name,
+            e.arguments,
+            e.product_name,
+            e.product_sku,
+            e.product_category,
+            e.product_price,
+            e.product_quantity,
+            COALESCE(e.is_fingerprinted, false) as is_fingerprinted,
+            COALESCE(e.is_reengagement, false) as is_reengagement,
+            COALESCE(e.is_view_through, false) as is_view_through,
+            DATE_DIFF(DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))), ic.install_date, DAY) as day_offset
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) BETWEEN DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + 1} DAY) AND DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + PREDICTION_DAYS} DAY)
+        WHERE e.name IS NOT NULL
+        ),
+
+        -- TARGET: D4-D33 LTV CALCULATION (same window as features for test data)
+        ltv_target AS (
+        SELECT 
+            ic.user_id,
+            SUM(COALESCE(e.converted_revenue, 0)) as ltv_target,
+            SUM(COALESCE(e.converted_revenue, 0)) as received_ltv_target,
+            COUNTIF(COALESCE(e.converted_revenue, 0) > 0) as purchase_events_target
+        FROM install_cohort ic
+        LEFT JOIN {table_path} e
+            ON ic.user_id = COALESCE(e.gaid, e.idfa, e.android_id, e.custom_user_id)
+            AND DATE(COALESCE(e.attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(e.server_timestamp_unix_utc AS INT64)))) BETWEEN DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + 1} DAY) AND DATE_ADD(ic.install_date, INTERVAL {FEATURE_DAYS + PREDICTION_DAYS} DAY)
+        GROUP BY ic.user_id
+        ),
+
+        -- FEATURE ENGINEERING (D4-D33 mapped to generic period names)
+        basic_engagement_metrics AS (
+        SELECT 
+            user_id,
+            COUNT(*) as total_events,
+            COUNT(DISTINCT session_id) as total_sessions,
+            COUNT(DISTINCT DATE(event_timestamp)) as active_days,
+            
+            -- Map D4-D33 to generic period names (same as train data structure)
+            COUNTIF(day_offset BETWEEN 4 AND 10) as period_1_events,      -- Days 4-10 → Period 1
+            COUNTIF(day_offset BETWEEN 11 AND 17) as period_2_events,     -- Days 11-17 → Period 2
+            COUNTIF(day_offset BETWEEN 18 AND 25) as period_3_events,     -- Days 18-25 → Period 3
+            COUNTIF(day_offset BETWEEN 26 AND 33) as period_4_events,     -- Days 26-33 → Period 4
+            
+            -- Session breakdown (same generic names)
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 4 AND 10 THEN session_id END) as period_1_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 11 AND 17 THEN session_id END) as period_2_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 18 AND 25 THEN session_id END) as period_3_sessions,
+            COUNT(DISTINCT CASE WHEN day_offset BETWEEN 26 AND 33 THEN session_id END) as period_4_sessions,
+            
+            -- Retention flags (same generic names)
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset BETWEEN 11 AND 33 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as next_period_retained,
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset BETWEEN 18 AND 33 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as period_plus_2_retained,
+            CASE WHEN COUNT(DISTINCT CASE WHEN day_offset BETWEEN 26 AND 33 THEN DATE(event_timestamp) END) >= 1 THEN 1 ELSE 0 END as period_plus_3_retained,
+            
+            MIN(event_timestamp) as first_event_timestamp,
+            MAX(event_timestamp) as last_event_timestamp
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        time_pattern_features AS (
+        SELECT 
+            user_id,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) BETWEEN 9 AND 17) as business_hours_events,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) BETWEEN 18 AND 22) as evening_events,
+            COUNTIF(EXTRACT(HOUR FROM event_timestamp) >= 23 OR EXTRACT(HOUR FROM event_timestamp) <= 6) as late_night_events,
+            COUNTIF(EXTRACT(DAYOFWEEK FROM event_timestamp) IN (1, 7)) as weekend_events,
+            COUNT(DISTINCT EXTRACT(HOUR FROM event_timestamp)) as active_hours_spread,
+            COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM event_timestamp)) as active_days_of_week,
+            COUNTIF(is_fingerprinted = true) as fingerprinted_events,
+            COUNTIF(is_reengagement = true) as reengagement_events,
+            COUNTIF(is_view_through = true) as view_through_events
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        game_specific_features AS (
+        SELECT 
+            user_id,
+            COUNTIF(LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%') as tutorial_completions,
+            CASE WHEN COUNTIF(LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%') > 0 THEN 1 ELSE 0 END as tutorial_completed_flag,
+            MIN(CASE WHEN LOWER(name) LIKE '%ftue_completed%' OR LOWER(name) LIKE '%tutorial%complete%' THEN event_timestamp END) as tutorial_completion_timestamp,
+            COUNTIF(LOWER(name) LIKE '%level_progress%' OR LOWER(name) LIKE '%level%complete%') as levels_completed,
+            MAX(CASE 
+            WHEN LOWER(name) LIKE '%level_progress%' OR LOWER(name) LIKE '%level%complete%'
+            THEN SAFE_CAST(COALESCE(
+                JSON_EXTRACT_SCALAR(arguments, '$.content_level_number'),
+                JSON_EXTRACT_SCALAR(arguments, '$.level'),
+                JSON_EXTRACT_SCALAR(arguments, '$.level_number')
+            ) AS INT64) 
+            END) as max_level_reached,
+            COUNTIF(LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') as total_ads_viewed,
+            COUNTIF(
+            (LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') AND 
+            (LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_placement_name')) LIKE '%reward%' OR
+            LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_type')) LIKE '%reward%' OR
+            LOWER(name) LIKE '%reward%')
+            ) as rewarded_ads_viewed,
+            COUNTIF(
+            (LOWER(name) LIKE '%ad%' OR LOWER(name) LIKE '%admon%') AND 
+            (LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_placement_name')) LIKE '%interstitial%' OR
+            LOWER(JSON_EXTRACT_SCALAR(arguments, '$.ad_type')) LIKE '%interstitial%' OR
+            LOWER(name) LIKE '%interstitial%')
+            ) as interstitial_ads_viewed,
+            COUNTIF(LOWER(name) LIKE '%store%' OR LOWER(name) LIKE '%shop%') as store_views,
+            COUNTIF(LOWER(name) LIKE '%purchase%intent%' OR LOWER(name) LIKE '%iap%click%') as purchase_intents,
+            COUNTIF(LOWER(name) = 'currency_earned') as currency_earned_events,
+            COUNTIF(LOWER(name) = 'currency_spent') as currency_spent_events,
+            COUNTIF(product_name IS NOT NULL AND COALESCE(product_price, 0) = 0) as product_interactions_non_revenue,
+            COUNT(DISTINCT CASE WHEN product_name IS NOT NULL AND COALESCE(product_price, 0) = 0 THEN product_name END) as unique_products_viewed,
+            COUNT(DISTINCT CASE WHEN product_sku IS NOT NULL AND COALESCE(product_price, 0) = 0 THEN product_sku END) as unique_skus_viewed,
+            COUNTIF(LOWER(name) LIKE '%social%' OR LOWER(name) LIKE '%share%' OR LOWER(name) LIKE '%invite%') as social_events,
+            COUNTIF(LOWER(name) LIKE '%achievement%' OR LOWER(name) LIKE '%trophy%' OR LOWER(name) LIKE '%leaderboard%') as achievement_events
+        FROM feature_window_events
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ),
+
+        session_timing_features AS (
+        SELECT 
+            user_id,
+            AVG(session_duration_minutes) as avg_session_length,
+            SUM(session_duration_minutes) as total_playtime_mins,
+            MAX(session_duration_minutes) as max_session_length,
+            MIN(CASE WHEN session_rank = 1 THEN session_start_hour END) as first_session_hour,
+            MIN(CASE WHEN session_rank = 1 THEN session_day_of_week END) as first_session_day_of_week
+        FROM (
+            SELECT 
+            user_id,
+            session_id,
+            MIN(event_timestamp) as session_start,
+            MAX(event_timestamp) as session_end,
+            EXTRACT(HOUR FROM MIN(event_timestamp)) as session_start_hour,
+            EXTRACT(DAYOFWEEK FROM MIN(event_timestamp)) as session_day_of_week,
+            TIMESTAMP_DIFF(MAX(event_timestamp), MIN(event_timestamp), MINUTE) as session_duration_minutes,
+            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY MIN(event_timestamp)) as session_rank
+            FROM feature_window_events
+            WHERE session_id IS NOT NULL AND user_id IS NOT NULL
+            GROUP BY user_id, session_id
+        )
+        GROUP BY user_id
+        )
+
+        -- FINAL TEST DATA OUTPUT - IDENTICAL STRUCTURE TO TRAIN DATA
+        SELECT 
+        ud.user_id,
+        ud.install_date,
+        ud.install_timestamp,
+        
+        -- Demographics
+        ud.country,
+        ud.city,
+        ud.state,
+        ud.platform,
+        ud.os_version,
+        ud.app_version,
+        ud.install_source,
+        ud.campaign_name,
+        ud.partner,
+        ud.publisher_name,
+        
+        -- Basic engagement metrics (SAME COLUMN NAMES as train data)
+        COALESCE(bem.total_events, 0) as total_events,
+        COALESCE(bem.total_sessions, 0) as total_sessions,
+        COALESCE(bem.active_days, 0) as active_days,
+        COALESCE(bem.period_1_events, 0) as period_1_events,
+        COALESCE(bem.period_2_events, 0) as period_2_events,
+        COALESCE(bem.period_3_events, 0) as period_3_events,
+        COALESCE(bem.period_4_events, 0) as period_4_events,
+        COALESCE(bem.period_1_sessions, 0) as period_1_sessions,
+        COALESCE(bem.period_2_sessions, 0) as period_2_sessions,
+        COALESCE(bem.period_3_sessions, 0) as period_3_sessions,
+        COALESCE(bem.period_4_sessions, 0) as period_4_sessions,
+        COALESCE(bem.next_period_retained, 0) as next_period_retained,
+        COALESCE(bem.period_plus_2_retained, 0) as period_plus_2_retained,
+        COALESCE(bem.period_plus_3_retained, 0) as period_plus_3_retained,
+        
+        -- Time patterns
+        COALESCE(tpf.business_hours_events, 0) as business_hours_events,
+        COALESCE(tpf.evening_events, 0) as evening_events,
+        COALESCE(tpf.late_night_events, 0) as late_night_events,
+        COALESCE(tpf.weekend_events, 0) as weekend_events,
+        COALESCE(tpf.active_hours_spread, 0) as active_hours_spread,
+        COALESCE(tpf.active_days_of_week, 0) as active_days_of_week,
+        COALESCE(tpf.fingerprinted_events, 0) as fingerprinted_events,
+        COALESCE(tpf.reengagement_events, 0) as reengagement_events,
+        COALESCE(tpf.view_through_events, 0) as view_through_events,
+        
+        -- Game features
+        COALESCE(gsf.tutorial_completed_flag, 0) as tutorial_completed_flag,
+        gsf.tutorial_completion_timestamp,
+        COALESCE(gsf.levels_completed, 0) as levels_completed,
+        COALESCE(gsf.max_level_reached, 0) as max_level_reached,
+        COALESCE(gsf.total_ads_viewed, 0) as total_ads_viewed,
+        COALESCE(gsf.rewarded_ads_viewed, 0) as rewarded_ads_viewed,
+        COALESCE(gsf.interstitial_ads_viewed, 0) as interstitial_ads_viewed,
+        COALESCE(gsf.store_views, 0) as store_views,
+        COALESCE(gsf.purchase_intents, 0) as purchase_intents,
+        COALESCE(gsf.currency_earned_events, 0) as currency_earned_events,
+        COALESCE(gsf.currency_spent_events, 0) as currency_spent_events,
+        COALESCE(gsf.product_interactions_non_revenue, 0) as product_interactions_non_revenue,
+        COALESCE(gsf.unique_products_viewed, 0) as unique_products_viewed,
+        COALESCE(gsf.unique_skus_viewed, 0) as unique_skus_viewed,
+        COALESCE(gsf.social_events, 0) as social_events,
+        COALESCE(gsf.achievement_events, 0) as achievement_events,
+        
+        -- Session timing
+        COALESCE(stf.avg_session_length, 0) as avg_session_length,
+        COALESCE(stf.total_playtime_mins, 0) as total_playtime_mins,
+        COALESCE(stf.max_session_length, 0) as max_session_length,
+        stf.first_session_hour,
+        stf.first_session_day_of_week,
+        
+        -- Install timing
+        EXTRACT(HOUR FROM ud.install_timestamp) as install_hour,
+        EXTRACT(DAYOFWEEK FROM ud.install_timestamp) as install_day_of_week,
+        EXTRACT(MONTH FROM ud.install_timestamp) as install_month,
+        TIMESTAMP_DIFF(bem.first_event_timestamp, ud.install_timestamp, MINUTE) as minutes_install_to_first_event,
+        TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) as minutes_install_to_tutorial,
+        
+        -- Advanced categorical features (IDENTICAL to train data)
+        CASE 
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 0 AND 5 THEN 'late_night_install'
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 6 AND 11 THEN 'morning_install' 
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 12 AND 17 THEN 'afternoon_install'
+            WHEN EXTRACT(HOUR FROM ud.install_timestamp) BETWEEN 18 AND 23 THEN 'evening_install'
+        END as install_time_segment,
+        
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 1 THEN 1 ELSE 0 END as install_sunday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 2 THEN 1 ELSE 0 END as install_monday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 3 THEN 1 ELSE 0 END as install_tuesday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 4 THEN 1 ELSE 0 END as install_wednesday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 5 THEN 1 ELSE 0 END as install_thursday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 6 THEN 1 ELSE 0 END as install_friday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) = 7 THEN 1 ELSE 0 END as install_saturday,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM ud.install_timestamp) IN (1, 7) THEN 1 ELSE 0 END as weekend_install,
+        
+        -- OS sophistication (IDENTICAL logic)
+        CASE 
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 11 THEN 'android_modern'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 9 THEN 'android_standard'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 7 THEN 'android_legacy'
+            WHEN ud.platform = 'android' THEN 'android_ancient'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 16 THEN 'ios_premium'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 14 THEN 'ios_modern'
+            WHEN ud.platform = 'ios' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 12 THEN 'ios_standard'
+            ELSE 'ios_legacy'
+        END as os_sophistication_tier,
+        
+        -- Country economic tier (IDENTICAL logic)
+        CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'NL', 'CH', 'NO', 'SE', 'DK') THEN 'tier_1_economy'
+            WHEN ud.country IN ('JP', 'KR', 'FR', 'IT', 'ES', 'BE', 'AT', 'FI', 'IE', 'NZ') THEN 'tier_1b_economy'
+            WHEN ud.country IN ('CN', 'SG', 'HK', 'TW', 'AE', 'QA', 'KW', 'SA', 'BH', 'OM') THEN 'tier_2_economy'
+            WHEN ud.country IN ('BR', 'MX', 'AR', 'CL', 'RU', 'TR', 'PL', 'CZ', 'HU', 'GR') THEN 'tier_3_economy'
+            WHEN ud.country IN ('IN', 'ID', 'TH', 'MY', 'PH', 'VN', 'ZA', 'EG', 'CO', 'PE') THEN 'tier_4_economy'
+            ELSE 'tier_5_economy'
+        END as economic_tier,
+        
+        -- Device tier (IDENTICAL logic)
+        CASE 
+            WHEN ud.platform = 'ios' THEN 'premium_platform'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 12 THEN 'premium_android'
+            WHEN ud.platform = 'android' AND SAFE_CAST(SPLIT(ud.os_version, '.')[OFFSET(0)] AS INT64) >= 9 THEN 'mid_tier_android'
+            ELSE 'budget_android'
+        END as device_tier,
+        
+        -- Ad behavior (IDENTICAL logic)
+        CASE 
+            WHEN COALESCE(gsf.rewarded_ads_viewed, 0) >= 5 AND COALESCE(gsf.interstitial_ads_viewed, 0) <= 2 THEN 'reward_seeker'
+            WHEN COALESCE(gsf.interstitial_ads_viewed, 0) >= 3 AND COALESCE(gsf.rewarded_ads_viewed, 0) <= 1 THEN 'ad_tolerant'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 8 THEN 'high_ad_engagement'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 3 THEN 'moderate_ad_engagement'
+            WHEN COALESCE(gsf.total_ads_viewed, 0) >= 1 THEN 'low_ad_engagement'
+            ELSE 'ad_avoider'
+        END as ad_behavior_profile,
+        
+        -- Tutorial completion speed (IDENTICAL logic)
+        CASE 
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 5 THEN 'instant_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 15 THEN 'fast_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 AND TIMESTAMP_DIFF(gsf.tutorial_completion_timestamp, ud.install_timestamp, MINUTE) <= 60 THEN 'slow_tutorial'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 THEN 'very_slow_tutorial'
+            ELSE 'no_tutorial'
+        END as tutorial_completion_speed,
+        
+        -- Progression tier (IDENTICAL logic)
+        CASE 
+            WHEN COALESCE(gsf.levels_completed, 0) >= 10 THEN 'fast_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 5 THEN 'moderate_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 2 THEN 'slow_progressor'
+            WHEN COALESCE(gsf.levels_completed, 0) >= 1 THEN 'minimal_progressor'
+            ELSE 'non_progressor'
+        END as progression_tier,
+        
+        -- Calculated ratios (IDENTICAL column names and logic)
+        SAFE_DIVIDE(COALESCE(bem.total_events, 0), NULLIF(COALESCE(bem.total_sessions, 0), 0)) as avg_events_per_session,
+        SAFE_DIVIDE(COALESCE(bem.total_events, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as avg_events_per_active_day,
+        SAFE_DIVIDE(COALESCE(bem.total_sessions, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as avg_sessions_per_day,
+        SAFE_DIVIDE(COALESCE(tpf.business_hours_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as business_hours_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.evening_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as evening_activity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.weekend_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as weekend_activity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.late_night_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as late_night_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.rewarded_ads_viewed, 0), NULLIF(COALESCE(gsf.total_ads_viewed, 0), 0)) as rewarded_ad_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.total_ads_viewed, 0), NULLIF(COALESCE(bem.total_sessions, 0), 0)) as ads_per_session,
+        SAFE_DIVIDE(COALESCE(gsf.total_ads_viewed, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as ad_engagement_rate,
+        SAFE_DIVIDE(COALESCE(gsf.product_interactions_non_revenue, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as product_interest_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.store_views, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as store_engagement_ratio,
+        SAFE_DIVIDE(COALESCE(gsf.purchase_intents, 0), NULLIF(COALESCE(gsf.store_views, 0), 0)) as store_conversion_intent_rate,
+        SAFE_DIVIDE(COALESCE(gsf.levels_completed, 0), NULLIF(COALESCE(bem.active_days, 0), 0)) as levels_per_day,
+        SAFE_DIVIDE(COALESCE(gsf.levels_completed, 0), NULLIF(COALESCE(bem.period_1_sessions, 0), 0)) as levels_per_session,
+        
+        -- Period growth ratios (IDENTICAL column names)
+        SAFE_DIVIDE(COALESCE(bem.period_2_events, 0), NULLIF(COALESCE(bem.period_1_events, 0), 0)) as period_2_to_1_growth_ratio,
+        SAFE_DIVIDE(COALESCE(bem.period_4_events, 0), NULLIF(COALESCE(bem.period_1_events, 0), 0)) as period_4_to_1_growth_ratio,
+        SAFE_DIVIDE(COALESCE(bem.period_2_sessions, 0), NULLIF(COALESCE(bem.period_1_sessions, 0), 0)) as session_growth_period_1_to_2,
+        
+        SAFE_DIVIDE(COALESCE(bem.active_days, 0), 4) as activity_consistency_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.active_hours_spread, 0), 24) as time_diversity_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.active_days_of_week, 0), 7) as weekly_consistency_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.fingerprinted_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as fingerprinted_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.reengagement_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as reengagement_ratio,
+        SAFE_DIVIDE(COALESCE(tpf.view_through_events, 0), NULLIF(COALESCE(bem.total_events, 0), 0)) as view_through_ratio,
+        
+        -- Platform × Country combo (IDENTICAL logic)
+        CONCAT(
+            CASE WHEN ud.platform = 'ios' THEN 'ios' ELSE 'android' END,
+            '_',
+            CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU') THEN 'premium_geo'
+            WHEN ud.country IN ('JP', 'KR', 'FR', 'IT', 'ES') THEN 'good_geo'
+            WHEN ud.country IN ('CN', 'BR', 'RU', 'IN', 'MX') THEN 'medium_geo'
+            ELSE 'other_geo'
+            END
+        ) as platform_geo_combo,
+        
+        -- Monetization potential (IDENTICAL logic)
+        CASE 
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'NL', 'CH', 'NO', 'SE', 'DK') 
+                AND ud.platform = 'ios' 
+                AND COALESCE(gsf.tutorial_completed_flag, 0) = 1 
+                AND COALESCE(gsf.total_ads_viewed, 0) >= 3 THEN 'high_monetization_potential'
+            WHEN ud.country IN ('US', 'GB', 'DE', 'CA', 'AU', 'JP', 'KR', 'FR', 'IT', 'ES') 
+                AND COALESCE(gsf.tutorial_completed_flag, 0) = 1 
+                AND COALESCE(bem.period_1_sessions, 0) >= 3 THEN 'medium_monetization_potential'
+            WHEN COALESCE(gsf.tutorial_completed_flag, 0) = 1 OR COALESCE(bem.period_1_sessions, 0) >= 2 THEN 'low_monetization_potential'
+            ELSE 'minimal_monetization_potential'
+        END as monetization_potential_tier,
+        
+        -- ==========================================
+        -- TARGET VARIABLES (IDENTICAL column names)
+        -- ==========================================
+        COALESCE(lt.ltv_target, 0) as ltv_target,
+        COALESCE(lt.received_ltv_target, 0) as received_ltv_target,
+        COALESCE(lt.purchase_events_target, 0) as purchase_events_target
+
+        FROM user_demographics ud
+        LEFT JOIN basic_engagement_metrics bem ON ud.user_id = bem.user_id
+        LEFT JOIN time_pattern_features tpf ON ud.user_id = tpf.user_id
+        LEFT JOIN game_specific_features gsf ON ud.user_id = gsf.user_id
+        LEFT JOIN session_timing_features stf ON ud.user_id = stf.user_id
+        LEFT JOIN ltv_target lt ON ud.user_id = lt.user_id
+        WHERE COALESCE(bem.total_events, 0) >= 1  -- At least some activity in D4-D33 window
+        ORDER BY ud.install_date, ud.user_id;
     """
     
     # Load Training Data (Oct 2024 - Mar 2025)
     print("\n1. Loading Training Cohort (Oct 2024 - Mar 2025)...")
-    train_query = base_query.format(start_date='2024-10-01', end_date='2025-03-31')
     train_data = client.query(train_query).result().to_dataframe()
     print(f"   Training cohort: {len(train_data):,} users")
     
     # Load Validation Data (Apr 2025)
     print("\n2. Loading Validation Cohort (Apr 2025)...")
-    val_query = base_query.format(start_date='2025-04-01', end_date='2025-04-30')
     val_data = client.query(val_query).result().to_dataframe()
     print(f"   Validation cohort: {len(val_data):,} users")
     
     # Load Test Data (May+ 2025)
     print("\n3. Loading Test Cohort (May+ 2025)...")
-    test_query = base_query.format(start_date='2025-05-01', end_date='2025-08-01')
     test_data = client.query(test_query).result().to_dataframe()
     print(f"   Test cohort: {len(test_data):,} users")
     
     print(f"\nDataset Summary:")
-    print(f"Train: {len(train_data):,} users, Avg LTV: ${train_data['ltv_30_days'].mean():.2f}")
-    print(f"Val: {len(val_data):,} users, Avg LTV: ${val_data['ltv_30_days'].mean():.2f}")
-    print(f"Test: {len(test_data):,} users, Avg LTV: ${test_data['ltv_30_days'].mean():.2f}")
+    print("train data features - ",train_data.columns)
+    print("val data features - ",val_data.columns)
+    print("test data features - ",test_data.columns)
+    print(f"Train: {len(train_data):,} users, Avg LTV: ${train_data['ltv_target'].mean():.2f}")
+    print(f"Val: {len(val_data):,} users, Avg LTV: ${val_data['ltv_target'].mean():.2f}")
+    print(f"Test: {len(test_data):,} users, Avg LTV: ${test_data['ltv_target'].mean():.2f}")
     
     return train_data, val_data, test_data
 
@@ -506,14 +1610,20 @@ def prepare_features(train_data, val_data, test_data):
     exclude_cols = [
         'user_id', 'install_date', 'install_timestamp', 
         'first_event', 'last_event',  # datetime columns
-        'ltv_30_days', 'received_ltv_30_days', 'purchase_events',  # target columns
-        'purchase_events_30d',  # additional target columns
-        'revenue', 'received_revenue', 'product_price',  # revenue columns to prevent leakage
-        'is_revenue_receipt_included', 'is_revenue_valid'  # revenue-related flags
+        'ltv_target', 'received_ltv_target', 'purchase_events',  # target columns
+        'purchase_events_30d', 'purchase_events_target',  # additional target columns
+        'revenue', 'received_revenue', 'product_price', 'converted_revenue',  # revenue columns to prevent leakage
+        'is_revenue_receipt_included', 'is_revenue_valid',  # revenue-related flags
+        'ltv_30_days', 'received_ltv_30_days',  # any LTV columns from features
+        # Remove product-related features that might indicate spending behavior
+        'product_interactions', 'unique_products_viewed', 'unique_skus_viewed',
+        'avg_quantity_per_interaction', 'total_quantity_interactions',
+        'product_interactions_per_session', 'product_diversity_rate', 'product_engagement_rate'
     ]
     
     # Get behavioral feature columns only
     all_cols = set(train_data.columns) & set(val_data.columns) & set(test_data.columns)
+    print(all_cols)
     feature_cols = [col for col in all_cols if col not in exclude_cols]
     
     print(f"Using {len(feature_cols)} behavioral features (no revenue data)")
@@ -524,17 +1634,17 @@ def prepare_features(train_data, val_data, test_data):
     X_test = test_data[feature_cols].copy()
     
     # Extract targets - handle different possible target column names
-    target_col = 'ltv_30_days'
-    if target_col not in train_data.columns:
-        print("Warning: ltv_30_days column not found, checking for alternatives...")
-        possible_targets = ['ltv_30_days', 'ltv_7_days', 'revenue_30d', 'total_revenue']
-        for col in possible_targets:
-            if col in train_data.columns:
-                target_col = col
-                print(f"Using target column: {target_col}")
-                break
-        else:
-            raise ValueError("No valid target column found!")
+    possible_targets = ['ltv_target', 'ltv_30_days', 'ltv_7_days', 'revenue_30d', 'total_revenue']
+    target_col = None
+    for col in possible_targets:
+        if col in train_data.columns:
+            target_col = col
+            print(f"Using target column: {target_col}")
+            break
+    
+    if target_col is None:
+        print("Available columns:", sorted(train_data.columns))
+        raise ValueError("No valid target column found!")
     
     y_train = train_data[target_col].copy()
     y_val = val_data[target_col].copy()
@@ -895,13 +2005,8 @@ def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, fe
     global PLOT_DATA
     PLOT_DATA.clear()
     
-    # Feature scaling
-    from sklearn.preprocessing import RobustScaler
-    print("\nScaling features using RobustScaler...")
-    scaler = RobustScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-    X_test_scaled = scaler.transform(X_test)
+    # No feature scaling needed for tree-based models
+    print("\nUsing unscaled features for tree-based models...")
     
     models = {}
     predictions = {}
@@ -920,74 +2025,95 @@ def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, fe
     # Create models directory
     os.makedirs('models', exist_ok=True)
     
-    # Define high-performing models only (removed KNN, SVR, Neural Network due to poor performance)
+    # Define models optimized for sparse target (many zeros)
     model_configs = {
         'XGBoost': xgb.XGBRegressor(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=20,  # Very low to prevent overfitting
+            max_depth=2,      # Very shallow trees
+            learning_rate=0.01, # Very slow learning
+            subsample=0.5,    # Strong subsampling
+            colsample_bytree=0.5, # Strong feature subsampling
+            reg_alpha=10.0,   # Very strong L1 regularization
+            reg_lambda=10.0,  # Very strong L2 regularization
+            min_child_weight=20, # Require many samples per leaf
             random_state=42,
             eval_metric='rmse'
         ),
         'CatBoost': CatBoostRegressor(
-            iterations=200,
-            depth=6,
-            learning_rate=0.1,
+            iterations=20,    # Very low
+            depth=2,          # Very shallow
+            learning_rate=0.01, # Very slow
+            l2_leaf_reg=100,  # Very strong L2 regularization
             random_seed=42,
             verbose=False
         ),
         'Random Forest': RandomForestRegressor(
-            n_estimators=100,
-            max_depth=10,
+            n_estimators=20,  # Very low
+            max_depth=2,      # Very shallow
+            min_samples_split=50, # Require many samples to split
+            min_samples_leaf=20,  # Require many samples per leaf
+            max_features=0.3, # Use fewer features
             random_state=42,
             n_jobs=-1
         ),
         'Extra Trees': ExtraTreesRegressor(
-            n_estimators=100,
-            max_depth=10,
+            n_estimators=20,  # Very low
+            max_depth=2,      # Very shallow  
+            min_samples_split=50, # Require many samples to split
+            min_samples_leaf=20,  # Require many samples per leaf
+            max_features=0.3, # Use fewer features
             random_state=42,
             n_jobs=-1
         ),
         'Gradient Boosting': GradientBoostingRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
+            n_estimators=20,  # Very low
+            max_depth=2,      # Very shallow
+            learning_rate=0.01, # Very slow learning
+            min_samples_split=50, # Require many samples to split
+            min_samples_leaf=20,  # Require many samples per leaf
+            subsample=0.5,    # Strong subsampling
             random_state=42
         ),
-        'AdaBoost': AdaBoostRegressor(
-            n_estimators=100,
-            learning_rate=1.0,
+        'Decision Tree': DecisionTreeRegressor(
+            max_depth=2,      # Very shallow
+            min_samples_split=100, # Very conservative splits
+            min_samples_leaf=50,   # Large leaves
             random_state=42
-        ),
-        'Ridge Regression': Ridge(alpha=1.0),
-        'Lasso Regression': Lasso(alpha=1.0),
-        'Elastic Net': ElasticNet(alpha=1.0, l1_ratio=0.5),
-        'Linear Regression': LinearRegression(),
-        'Decision Tree': DecisionTreeRegressor(max_depth=10, random_state=42)
+        )
+        # Remove linear models as they're performing very poorly with scaling
     }
+    
+    # Data validation before training
+    print(f"\nData validation:")
+    print(f"Train set: {X_train.shape[0]} samples, {X_train.shape[1]} features")
+    print(f"Val set: {X_val.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+    
+    # Check for potential data leakage - target distribution should be similar
+    print(f"\nTarget distribution check:")
+    print(f"Train spenders: {(y_train > 0).sum()} ({(y_train > 0).mean():.1%})")
+    print(f"Val spenders: {(y_val > 0).sum()} ({(y_val > 0).mean():.1%})")
+    print(f"Test spenders: {(y_test > 0).sum()} ({(y_test > 0).mean():.1%})")
+    
+    # Warn about small test set
+    if len(y_test) < 100:
+        print(f"\nWARNING: Very small test set ({len(y_test)} samples) - results may be unreliable!")
     
     print(f"\nTraining {len(model_configs)} different models...")
     
     for name, model in model_configs.items():
         print(f"\n--- Training {name} ---")
         try:
-            # Use scaled data for models that benefit from it
-            use_scaled = name in ['Ridge Regression', 'Lasso Regression', 'Elastic Net', 'Linear Regression']
-            
-            if use_scaled:
-                X_tr, X_v, X_te = X_train_scaled, X_val_scaled, X_test_scaled
-            else:
-                X_tr, X_v, X_te = X_train, X_val, X_test
+            # All models use unscaled data (tree-based only)
+            X_tr, X_v, X_te = X_train, X_val, X_test
             
             # Train model
             model.fit(X_tr, y_train)
             
-            # Make predictions
-            train_pred = model.predict(X_tr)
-            val_pred = model.predict(X_v)
-            test_pred = model.predict(X_te)
+            # Make predictions and ensure non-negative (LTV can't be negative)
+            train_pred = np.maximum(model.predict(X_tr), 0)
+            val_pred = np.maximum(model.predict(X_v), 0)
+            test_pred = np.maximum(model.predict(X_te), 0)
             
             # Calculate metrics
             train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
@@ -1057,6 +2183,14 @@ def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, fe
             print(f"   Train RMSE: ${train_rmse:.2f}, Val RMSE: ${val_rmse:.2f}, Test RMSE: ${test_rmse:.2f}")
             print(f"   Train R²: {train_r2:.3f}, Val R²: {val_r2:.3f}, Test R²: {test_r2:.3f}")
             
+            # Check for overfitting
+            r2_gap = train_r2 - val_r2
+            if r2_gap > 0.3:
+                print(f"   ⚠️  WARNING: Possible overfitting (Train-Val R² gap: {r2_gap:.3f})")
+            
+            if test_r2 < 0:
+                print(f"   ❌ WARNING: Negative test R² ({test_r2:.3f}) - model performing worse than baseline")
+            
         except Exception as e:
             print(f"   Error training {name}: {str(e)}")
             continue
@@ -1077,9 +2211,10 @@ def train_ensemble_ltv_models(X_train, X_val, X_test, y_train, y_val, y_test, fe
         comparison_df.to_csv('model_comparison_results.csv', index=False)
         print(f"\nSaved model comparison results to 'model_comparison_results.csv'")
         
-        # Save scaler
-        joblib.dump(scaler, 'models/feature_scaler.pkl')
-        print(f"Saved feature scaler to 'models/feature_scaler.pkl'")
+        # Save feature column names (no scaler needed for tree models)
+        with open('models/feature_columns.txt', 'w') as f:
+            f.write('\n'.join(feature_cols))
+        print(f"Saved feature columns to 'models/feature_columns.txt'")
         
         # Create ensemble prediction (simple average of top 3 models)
         top_3_models = comparison_df.head(3)['Model'].tolist()
@@ -1139,9 +2274,9 @@ def save_datasets(train_data, val_data, test_data, X_train, X_val, X_test, y_tra
     pd.DataFrame(X_test, columns=feature_cols).to_csv('data/X_test.csv', index=False)
     
     # Save targets
-    pd.DataFrame({'ltv_30_days': y_train}).to_csv('data/y_train.csv', index=False)
-    pd.DataFrame({'ltv_30_days': y_val}).to_csv('data/y_val.csv', index=False)
-    pd.DataFrame({'ltv_30_days': y_test}).to_csv('data/y_test.csv', index=False)
+    pd.DataFrame({'ltv_target': y_train}).to_csv('data/y_train.csv', index=False)
+    pd.DataFrame({'ltv_target': y_val}).to_csv('data/y_val.csv', index=False)
+    pd.DataFrame({'ltv_target': y_test}).to_csv('data/y_test.csv', index=False)
     
     # Save feature column names
     joblib.dump(feature_cols, 'data/feature_columns.pkl')
@@ -1206,9 +2341,9 @@ def load_existing_datasets():
             X_test = pd.read_csv('data/X_test.csv')
             
             # Load targets
-            y_train = pd.read_csv('data/y_train.csv')['ltv_30_days'].values
-            y_val = pd.read_csv('data/y_val.csv')['ltv_30_days'].values
-            y_test = pd.read_csv('data/y_test.csv')['ltv_30_days'].values
+            y_train = pd.read_csv('data/y_train.csv')['ltv_target'].values
+            y_val = pd.read_csv('data/y_val.csv')['ltv_target'].values
+            y_test = pd.read_csv('data/y_test.csv')['ltv_target'].values
             
             # Load feature columns
             feature_cols = joblib.load('data/feature_columns.pkl')
@@ -1252,20 +2387,23 @@ def main():
         # Load and prepare data from scratch
         print("\nLoading datasets from BigQuery...")
         train_data, val_data, test_data = load_temporal_datasets()
+        print("train data features - ",train_data.columns)
+        print("val data features - ",val_data.columns)
+        print("test data features - ",test_data.columns)
         
-        if train_data is None:
-            print("No data loaded. Exiting.")
-            return None, None, None, None
-        
-        # Prepare features
-        print("Preparing features...")
-        X_train, X_val, X_test, y_train, y_val, y_test, feature_cols = prepare_features(
-            train_data, val_data, test_data
-        )
-        
-        # Save datasets
-        save_datasets(train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols)
+    if train_data is None:
+        print("No data loaded. Exiting.")
+        return None, None, None, None
     
+    # Prepare features
+    print("Preparing features...")
+    X_train, X_val, X_test, y_train, y_val, y_test, feature_cols = prepare_features(
+        train_data, val_data, test_data
+    )
+    
+    # Save datasets
+    save_datasets(train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols)
+
     # Train models
     print("Training models...")
     models, predictions, comparison_df = train_ensemble_ltv_models(
