@@ -2275,16 +2275,7 @@ def save_datasets(train_data, val_data, test_data, X_train, X_val, X_test, y_tra
 
 def load_existing_datasets():
     """Load temporal datasets using D0-D3 behavioral features → D4-D33 LTV targets"""
-    
-    # First try BigQuery temporal approach
-    try:
-        from google.cloud import bigquery
-        return load_temporal_datasets()
-        
-    except Exception as e:
-        print(f"BigQuery temporal loading failed: {e}")
-        print("Falling back to CSV file with enhanced synthetic LTV targets...")
-        return load_from_csv_with_ltv()
+    return load_from_csv_with_ltv()
 
 def load_temporal_datasets():
     """Load temporal datasets using only behavioral features (no revenue features)"""
@@ -2297,10 +2288,10 @@ def load_temporal_datasets():
     print("="*80)
     print("LOADING DATASETS - BEHAVIORAL FEATURES ONLY")
     print("="*80)
-    print("Train: 70% of users, D0-D3 behavioral features → D4-D33 LTV targets")
-    print("Val: 15% of users, D0-D3 behavioral features → D4-D33 LTV targets")
-    print("Test: 15% of users, D0-D3 behavioral features → D4-D33 LTV targets")
-    print("Split Method: Random ratio-based (reproducible with seed=42)")
+    print("Train: Till March 15, D0-D3 behavioral features → D4-D33 LTV targets")
+    print("Val: March 15 - April 15, D0-D3 behavioral features → D4-D33 LTV targets")
+    print("Test: Post April 15, D0-D3 behavioral features → D4-D33 LTV targets")
+    print("Split Method: Temporal based on install_date")
     print("="*80)
     
     PROJECT_ID = "gc-forecasting-dev"
@@ -2320,7 +2311,7 @@ def load_temporal_datasets():
           DATE(MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64))))) as install_date,
           MIN(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) as install_timestamp
       FROM `{table_path}`
-      WHERE DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) >= '2024-06-01'
+      WHERE DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) >= '2024-01-01'
           AND DATE(COALESCE(attribution_event_timestamp, TIMESTAMP_SECONDS(CAST(server_timestamp_unix_utc AS INT64)))) <= '2024-12-01'
           AND COALESCE(gaid, idfa, android_id, custom_user_id) IS NOT NULL
           AND COALESCE(gaid, idfa, android_id, custom_user_id) != ''
@@ -2403,7 +2394,7 @@ def load_temporal_datasets():
     """
     
     print("Executing BigQuery query...")
-    data = client.query(query).to_dataframe()
+    data = client.query(data_query).to_dataframe()
     
     print(f"Loaded BigQuery data with shape: {data.shape}")
     print(f"Columns: {list(data.columns)}")
@@ -2426,53 +2417,56 @@ def load_temporal_datasets():
     print(f"  Max: ${data['ltv_target'].max():.2f}")
     print(f"  Paying users: {(data['ltv_target'] > 0).sum()}/{len(data)} ({(data['ltv_target'] > 0).mean()*100:.1f}%)")
     
+    # Convert install_date to datetime if it's not already
+    data['install_date'] = pd.to_datetime(data['install_date'])
+    
+    # Temporal split based on install_date
+    train_mask = (data['install_date'] >= '2025-03-01') & (data['install_date'] < '2025-06-15')
+    val_mask = (data['install_date'] >= '2025-06-15') & (data['install_date'] < '2025-07-15')
+    test_mask = data['install_date'] >= '2025-07-15'
+    
+    train_data = data[train_mask].copy()
+    val_data = data[val_mask].copy()
+    test_data = data[test_mask].copy()
+    
+    print(f"Temporal data split completed:")
+    print(f"  Train: {len(train_data)} samples ({len(train_data)/len(data)*100:.1f}%) - Till March 15")
+    print(f"  Val: {len(val_data)} samples ({len(val_data)/len(data)*100:.1f}%) - March 15 to April 15")
+    print(f"  Test: {len(test_data)} samples ({len(test_data)/len(data)*100:.1f}%) - Post April 15")
+    
     # Prepare features and target
     target_col = 'ltv_target'
     feature_cols = [col for col in data.columns if col not in ['user_id', 'install_date', target_col]]
     
-    X = data[feature_cols].copy()
-    y = data[target_col].values
+    X_train = train_data[feature_cols].copy()
+    X_val = val_data[feature_cols].copy()
+    X_test = test_data[feature_cols].copy()
+    
+    y_train = train_data[target_col].values
+    y_val = val_data[target_col].values
+    y_test = test_data[target_col].values
     
     print(f"Features: {len(feature_cols)} columns")
     print(f"Target: {target_col}")
     
-    # Train/validation/test split (70/15/15) - no stratification for regression
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.15, random_state=42
-    )
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.176, random_state=42  # 0.176 ≈ 0.15/0.85
-    )
-    
-    # Create raw data splits for reference
-    train_indices = X_train.index
-    val_indices = X_val.index  
-    test_indices = X_test.index
-    
-    train_data = data.iloc[train_indices].copy()
-    val_data = data.iloc[val_indices].copy()
-    test_data = data.iloc[test_indices].copy()
-    
-    print(f"Data split completed:")
-    print(f"  Train: {X_train.shape[0]} samples ({X_train.shape[0]/len(data)*100:.1f}%)")
-    print(f"  Val: {X_val.shape[0]} samples ({X_val.shape[0]/len(data)*100:.1f}%)")
-    print(f"  Test: {X_test.shape[0]} samples ({X_test.shape[0]/len(data)*100:.1f}%)")
-    
     return train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
 
+
 def load_from_csv_with_ltv():
-    """Load from CSV file and create realistic LTV targets based on engagement"""
+    """Load from gzipped CSV file and create realistic LTV targets based on engagement"""
     import os
+    import gzip
     
-    # Load the main dataset
-    data_file = 'data/d0_d2_data.csv'
+    # Load the gzipped CSV file
+    data_file = 'data/d0_d2_data.csv.gz'
     if not os.path.exists(data_file):
         print(f"Error: {data_file} not found!")
         return None, None, None, None, None, None, None, None, None, None
     
-    data = pd.read_csv(data_file)
+    print(f"Loading gzipped CSV file: {data_file}")
+    data = pd.read_csv(data_file, compression='gzip')
     print(f"Loaded CSV data with shape: {data.shape}")
+    print(f"Columns: {list(data.columns)}")
     
     # Map CSV columns to BigQuery-like columns for consistency
     column_mapping = {
@@ -2562,6 +2556,7 @@ def load_from_csv_with_ltv():
     n_converters = converters_mask.sum()
     if n_converters > 0:
         # Most spenders spend small amounts, few spend large amounts (Pareto distribution)
+        np.random.seed(42)  # For reproducibility
         spending_amounts = np.random.pareto(1.2, n_converters) * 10  # Scale to reasonable amounts
         spending_amounts = np.clip(spending_amounts, 0.99, 500)  # Min $0.99, max $500
         
@@ -2572,6 +2567,7 @@ def load_from_csv_with_ltv():
         data.loc[converters_mask, 'ltv_target'] = spending_amounts
     
     # Add some randomness for realism but preserve the behavioral correlation
+    np.random.seed(50)  # For reproducibility
     noise = np.random.normal(0, 0.5, len(data))
     data['ltv_target'] = np.maximum(0, data['ltv_target'] + noise)
     
@@ -2583,39 +2579,71 @@ def load_from_csv_with_ltv():
     print(f"  Max: ${data['ltv_target'].max():.2f}")
     print(f"  Paying users: {(data['ltv_target'] > 0).sum()}/{len(data)} ({(data['ltv_target'] > 0).mean()*100:.1f}%)")
     
+    # Convert install_date to datetime if it exists and is not already datetime
+    if 'install_date' in data.columns:
+        if not pd.api.types.is_datetime64_any_dtype(data['install_date']):
+            data['install_date'] = pd.to_datetime(data['install_date'])
+    else:
+        # If no install_date column, we need to create one or use a different approach
+        print("Warning: No 'install_date' column found. Cannot perform temporal split.")
+        print("Available columns:", list(data.columns))
+        
+        # Check for alternative date columns
+        date_cols = [col for col in data.columns if 'date' in col.lower()]
+        if date_cols:
+            print(f"Found potential date columns: {date_cols}")
+            # Use the first date column found
+            date_col = date_cols[0]
+            data['install_date'] = pd.to_datetime(data[date_col])
+            print(f"Using {date_col} as install_date")
+        else:
+            # Create dummy dates for demonstration (this should be replaced with actual logic)
+            print("Creating dummy install dates for demonstration...")
+            np.random.seed(42)
+            start_date = pd.to_datetime('2024-01-01')
+            end_date = pd.to_datetime('2024-06-01')
+            date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+            data['install_date'] = np.random.choice(date_range, size=len(data))
+    
+    # Temporal split based on install_date
+    print("Temporal split based on install_date...", data['install_date'].min(), data['install_date'].max())
+    print("Available dates:", data['install_date'].unique())
+    
+    train_mask = (data['install_date'] >= '2025-03-01') & (data['install_date'] < '2025-06-15')
+    val_mask = (data['install_date'] >= '2025-06-15') & (data['install_date'] < '2025-07-15')
+    test_mask = data['install_date'] >= '2025-07-15'
+    
+    train_data = data[train_mask].copy()
+    val_data = data[val_mask].copy()
+    test_data = data[test_mask].copy()
+    
+    print(f"Temporal data split completed:")
+    print(f"  Train: {len(train_data)} samples ({len(train_data)/len(data)*100:.1f}%) - Till March 15")
+    print(f"  Val: {len(val_data)} samples ({len(val_data)/len(data)*100:.1f}%) - March 15 to April 15")
+    print(f"  Test: {len(test_data)} samples ({len(test_data)/len(data)*100:.1f}%) - Post April 15")
+    
+    if len(train_data) == 0 or len(val_data) == 0 or len(test_data) == 0:
+        print("Warning: One or more splits are empty. Check date ranges and data.")
+        print(f"Date range in data: {data['install_date'].min()} to {data['install_date'].max()}")
+    
     # Prepare features and target (remove original columns that were mapped)
     target_col = 'ltv_target'
     exclude_cols = ['device_id', 'install_date', target_col, 'is_payer_30d'] + list(column_mapping.keys())
+    # Filter out columns that don't actually exist in the data
+    exclude_cols = [col for col in exclude_cols if col in data.columns]
     feature_cols = [col for col in data.columns if col not in exclude_cols]
     
-    X = data[feature_cols].copy()
-    y = data[target_col].values
+    X_train = train_data[feature_cols].copy()
+    X_val = val_data[feature_cols].copy()
+    X_test = test_data[feature_cols].copy()
+    
+    y_train = train_data[target_col].values
+    y_val = val_data[target_col].values
+    y_test = test_data[target_col].values
     
     print(f"Features: {len(feature_cols)} columns")
+    print(f"Feature columns: {feature_cols}")
     print(f"Target: {target_col}")
-    
-    # Train/validation/test split (70/15/15) - no stratification for regression
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.15, random_state=42
-    )
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.176, random_state=42  # 0.176 ≈ 0.15/0.85
-    )
-    
-    # Create raw data splits for reference
-    train_indices = X_train.index
-    val_indices = X_val.index  
-    test_indices = X_test.index
-    
-    train_data = data.iloc[train_indices].copy()
-    val_data = data.iloc[val_indices].copy()
-    test_data = data.iloc[test_indices].copy()
-    
-    print(f"Data split completed:")
-    print(f"  Train: {X_train.shape[0]} samples ({X_train.shape[0]/len(data)*100:.1f}%)")
-    print(f"  Val: {X_val.shape[0]} samples ({X_val.shape[0]/len(data)*100:.1f}%)")
-    print(f"  Test: {X_test.shape[0]} samples ({X_test.shape[0]/len(data)*100:.1f}%)")
     
     return train_data, val_data, test_data, X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
 
